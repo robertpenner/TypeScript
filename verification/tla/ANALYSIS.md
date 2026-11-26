@@ -14,6 +14,8 @@ The remaining defects live in shared concurrent primitives (`dirty.SyncMap`, `Re
 
 Every defect traces back to the same underlying design pattern: splitting one logical state transition across multiple synchronization domains (two mutexes, `collections.SyncMap` plus per-entry `sync.Mutex`, an `atomic.Bool` plus a mutex, or an unlocked I/O/RPC window) without carrying explicit lifecycle state or object identity across the gap. By contrast, `project.checkerPool` passed 26.9M+ TLC states with zero violations because one mutex owns all mutable state, blocking happens only on bounded semaphores outside the lock, and re-entry validates object identity. Existing Go tests in all 8 packages missed these bugs because they tested single-operation races rather than cross-operation interleavings.
 
+An upstream novelty search against `microsoft/TypeScript` (issues and PRs, 2026-11-26) found that **8 of the 9 buggy components (16 of 17 defects) have zero matching open upstream issues or PRs**. The sole exception, the `ExtendedConfigCache` AB-BA deadlock, independently rediscovered real open upstream issues (`microsoft/TypeScript#64833` for `tsc -b` and `microsoft/TypeScript#65300` for `[api]`, with open PR `microsoft/TypeScript#65302`), validating that TLC is finding genuine production defects rather than synthetic artifacts.
+
 ---
 
 ## 1. Severity and Production Reachability Triage
@@ -25,6 +27,7 @@ Not every verified defect carries the same operational risk. Separating directly
 1. **Permanent AB-BA deadlock on cyclic tsconfig `extends`** (`tsc/internal/execute/tsc/extendedconfigcache.go`, `tsc/internal/project/ownercache.go`, `tsc/internal/tsoptions/tsconfigparsing.go`)
    - **Impact:** Permanent hang in parallel `tsc --build` or LSP config parsing whenever two projects enter a cyclic `extends` pair (`a.json <-> b.json`) from opposite ends.
    - **Why it matters:** `tsconfigparsing.go` already includes a `resolutionStack` check and `extendedconfigcache_test.go` already has a regression test for single-goroutine mutual cycles. The existing guard prevents self-deadlock on one goroutine while leaving two-goroutine AB-BA deadlock wide open.
+   - **Upstream status:** Already tracked in `microsoft/TypeScript#64833` (`tsc -b`, open, no PR yet) and `microsoft/TypeScript#65300` (`[api]`, open) with open PR `microsoft/TypeScript#65302` (`[api] Parse a new owner cache entry without holding its lock`). Do not duplicate `#65302`.
 
 2. **Silently dropped `$/cancelRequest` in LSP** (`tsc/internal/lsp/server.go:994-1064`)
    - **Impact:** Directly hits interactive editing. Whenever `dispatchLoop` is occupied with preceding edits (`textDocument/didChange`), queued requests sit in `s.requestQueue` invisible to `readLoop`'s `cancelRequest` lookup in `s.pendingClientRequests`. Every `$/cancelRequest` arriving during that queue residency is silently discarded, and the server later executes the stale request to completion with an uncanceled context.
