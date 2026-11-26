@@ -167,3 +167,206 @@ func TestSyncConnNotificationHandlerCanCall(t *testing.T) {
 		assert.Equal(t, string(result), `"outer"`)
 	})
 }
+
+type bufferedChannelProtocol struct {
+	in  chan *ipc.Message
+	out chan *ipc.Message
+}
+
+func newBufferedChannelProtocolPair(buf int) (*bufferedChannelProtocol, *bufferedChannelProtocol) {
+	aToB := make(chan *ipc.Message, buf)
+	bToA := make(chan *ipc.Message, buf)
+	return &bufferedChannelProtocol{in: bToA, out: aToB}, &bufferedChannelProtocol{in: aToB, out: bToA}
+}
+
+func (p *bufferedChannelProtocol) ReadMessage() (*ipc.Message, error) {
+	msg, ok := <-p.in
+	if !ok {
+		return nil, io.EOF
+	}
+	return msg, nil
+}
+
+func (p *bufferedChannelProtocol) WriteRequest(id *jsonrpc.ID, method string, params any) error {
+	raw, _ := json.Marshal(params)
+	p.out <- &ipc.Message{ID: id, Method: method, Params: raw}
+	return nil
+}
+
+func (p *bufferedChannelProtocol) WriteNotification(method string, params any) error {
+	raw, _ := json.Marshal(params)
+	p.out <- &ipc.Message{Method: method, Params: raw}
+	return nil
+}
+
+func (p *bufferedChannelProtocol) WriteResponse(id *jsonrpc.ID, result any) error {
+	raw, _ := json.Marshal(result)
+	p.out <- &ipc.Message{ID: id, Result: raw}
+	return nil
+}
+
+func (p *bufferedChannelProtocol) WriteError(id *jsonrpc.ID, err *jsonrpc.ResponseError) error {
+	p.out <- &ipc.Message{ID: id, Error: err}
+	return nil
+}
+
+func (p *bufferedChannelProtocol) Close() {
+	close(p.out)
+}
+
+type blockingSyncNotifHandler struct {
+	noOpHandler
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingSyncNotifHandler) HandleNotification(context.Context, string, json.Value) error {
+	close(h.entered)
+	<-h.release
+	return nil
+}
+
+func TestSyncConnNotificationDoesNotSwapConcurrentCallResponses(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		serverProto, peerProto := newBufferedChannelProtocolPair(8)
+		handler := &blockingSyncNotifHandler{
+			entered: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		conn := ipc.NewSyncConn(nil, serverProto, handler)
+
+		go func() {
+			req1, err := peerProto.ReadMessage()
+			if err != nil {
+				return
+			}
+			// Peer sends a notification followed immediately by G1's response
+			// without waiting for the server to handle the notification.
+			_ = peerProto.WriteNotification("log", "progress")
+			_ = peerProto.WriteResponse(req1.ID, "CONTENT_A")
+
+			req2, err := peerProto.ReadMessage()
+			if err != nil {
+				return
+			}
+			_ = peerProto.WriteResponse(req2.ID, "CONTENT_B")
+		}()
+
+		var wg sync.WaitGroup
+		var res1, res2 json.Value
+		var err1, err2 error
+
+		wg.Go(func() {
+			res1, err1 = conn.Call(t.Context(), "readFile", "a.ts")
+		})
+
+		<-handler.entered
+
+		// G1 is inside HandleNotification; an unrelated concurrent Call must not
+		// steal the wire and consume G1's already-buffered response.
+		wg.Go(func() {
+			res2, err2 = conn.Call(t.Context(), "readFile", "b.ts")
+		})
+		synctest.Wait()
+
+		close(handler.release)
+		wg.Wait()
+		serverProto.Close()
+		peerProto.Close()
+
+		assert.NilError(t, err1)
+		assert.NilError(t, err2)
+		assert.Equal(t, string(res1), `"CONTENT_A"`)
+		assert.Equal(t, string(res2), `"CONTENT_B"`)
+	})
+}
+
+type cancelledCallHandler struct {
+	noOpHandler
+	conn *ipc.SyncConn
+}
+
+func (h *cancelledCallHandler) HandleRequest(_ context.Context, _ string, _ json.Value) (any, error) {
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := h.conn.Call(cancelledCtx, "readFile", "cancelled.ts")
+	if !errors.Is(err, context.Canceled) {
+		return nil, err
+	}
+	return "ok", nil
+}
+
+func TestSyncConnCancelledCallDoesNotWriteOrPoisonRun(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		serverProto, peerProto := newBufferedChannelProtocolPair(8)
+		handler := &cancelledCallHandler{}
+		conn := ipc.NewSyncConn(nil, serverProto, handler)
+		handler.conn = conn
+
+		runErrCh := make(chan error, 1)
+		go func() {
+			runErrCh <- conn.Run(t.Context())
+		}()
+
+		assert.NilError(t, peerProto.WriteRequest(jsonrpc.NewIDInt(1), "check", nil))
+
+		// Because the callback's context was already cancelled, no "readFile"
+		// request should be written on the wire; the peer should directly receive
+		// the response to "check" (id=1).
+		msg, err := peerProto.ReadMessage()
+		assert.NilError(t, err)
+		if msg.IsRequest() {
+			// If buggy code still wrote the cancelled callback request, reply to it
+			// and drain the "check" response so Run() fails visibly.
+			_ = peerProto.WriteResponse(msg.ID, "STALE_REPLY")
+			_, _ = peerProto.ReadMessage()
+			t.Fatalf("cancelled Call wrote unexpected request %q on wire", msg.Method)
+		}
+		assert.Assert(t, msg.IsResponse())
+		assert.Equal(t, string(msg.Result), `"ok"`)
+
+		peerProto.Close()
+		assert.NilError(t, <-runErrCh)
+	})
+}
+
+type cancelOnWriteProtocol struct {
+	*bufferedChannelProtocol
+	cancel context.CancelFunc
+}
+
+func (p *cancelOnWriteProtocol) WriteRequest(id *jsonrpc.ID, method string, params any) error {
+	err := p.bufferedChannelProtocol.WriteRequest(id, method, params)
+	p.cancel()
+	return err
+}
+
+func TestSyncConnCallCancelledDuringWriteDrainsResponse(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		serverProto, peerProto := newBufferedChannelProtocolPair(8)
+		ctx, cancel := context.WithCancel(t.Context())
+		wrapped := &cancelOnWriteProtocol{bufferedChannelProtocol: serverProto, cancel: cancel}
+		conn := ipc.NewSyncConn(nil, wrapped, noOpHandler{})
+
+		var peerWg sync.WaitGroup
+		peerWg.Go(func() {
+			defer peerProto.Close()
+			req, err := peerProto.ReadMessage()
+			if err != nil {
+				return
+			}
+			_ = peerProto.WriteResponse(req.ID, "DRAINED_REPLY")
+		})
+
+		_, err := conn.Call(ctx, "readFile", "midflight.ts")
+		assert.Assert(t, errors.Is(err, context.Canceled), "expected context.Canceled, got %v", err)
+
+		peerWg.Wait()
+		// The response must have been drained so Run() does not fail with an
+		// unexpected response message.
+		assert.NilError(t, conn.Run(t.Context()))
+	})
+}

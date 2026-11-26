@@ -13,6 +13,10 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/jsonrpc"
 )
 
+type syncConnNotifKey struct {
+	conn *SyncConn
+}
+
 // SyncConn manages bidirectional communication with synchronous request handling.
 // Requests are handled one at a time inline, and outgoing calls are serialized.
 type SyncConn struct {
@@ -29,9 +33,18 @@ type SyncConn struct {
 	// spawning goroutines that invoke filesystem callbacks) don't corrupt the stream.
 	mu sync.Mutex
 
-	calls   int
-	reading bool
-	turn    sync.Cond
+	calls      int
+	reading    bool
+	notifDepth int
+	turn       sync.Cond
+}
+
+func (c *SyncConn) notifOwner(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	depth, _ := ctx.Value(syncConnNotifKey{conn: c}).(int)
+	return depth
 }
 
 // NewSyncConn creates a new sync connection with the given transport and handler.
@@ -94,6 +107,7 @@ func (c *SyncConn) lockTurn(depth int) {
 		c.turn.Wait()
 	}
 	c.reading = depth > 0
+	c.notifDepth = 0
 }
 
 // handleRequest processes an incoming request.
@@ -189,15 +203,21 @@ func (c *SyncConn) Call(ctx context.Context, method string, params any) (json.Va
 	// 3. We need to ensure write/read pairs are atomic
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for c.reading {
+	for c.reading || (c.notifDepth > 0 && c.notifOwner(ctx) != c.notifDepth) {
 		c.turn.Wait()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prevNotifDepth := c.notifDepth
+	c.notifDepth = 0
 	c.calls++
 	c.reading = true
 	depth := c.calls
 	defer func() {
 		c.calls--
 		c.reading = false
+		c.notifDepth = prevNotifDepth
 		c.turn.Broadcast()
 	}()
 
@@ -207,18 +227,19 @@ func (c *SyncConn) Call(ctx context.Context, method string, params any) (json.Va
 		return nil, err
 	}
 
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-
 	for {
-		// Read the response inline.
+		// Read the response inline. Once the request has been written to the wire,
+		// drain its matching response even if ctx was cancelled mid-flight so no
+		// orphaned response remains on the stream.
 		msg, err := c.protocol.ReadMessage()
 		if err != nil {
 			return nil, err
 		}
 
 		if msg.IsResponse() && msg.ID != nil && msg.ID.String() == method {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if msg.Error != nil {
 				return nil, fmt.Errorf("ipc: remote error [%d]: %s", msg.Error.Code, msg.Error.Message)
 			}
@@ -238,10 +259,15 @@ func (c *SyncConn) Call(ctx context.Context, method string, params any) (json.Va
 			continue
 		}
 		if msg.IsNotification() {
+			// Only nested calls descending from this notification handler may take
+			// the wire while HandleNotification runs; unrelated concurrent callers
+			// must wait so they cannot steal this call's buffered response.
 			c.reading = false
+			c.notifDepth = depth
 			c.turn.Broadcast()
 			c.mu.Unlock()
-			c.handleNotification(ctx, msg)
+			notifCtx := context.WithValue(ctx, syncConnNotifKey{conn: c}, depth)
+			c.handleNotification(notifCtx, msg)
 			c.lockTurn(depth)
 			continue
 		}
