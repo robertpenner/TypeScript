@@ -2,99 +2,135 @@
 EXTENDS Integers
 
 \* Faithful model of tsc/internal/api/session.go:
-\* - getSnapshotData (lines 703-711): looks up sd under RLock, unlocks WITHOUT retaining!
-\* - releaseSnapshot (lines 725-743): decrements refCount, deletes from s.snapshots, calls sd.snapshot.Deref()
-\* - registerSnapshot (lines 1865-1891): inserts into s.snapshots without checking closed
-\* - Close (lines 5789-5810): clears s.snapshots and calls Deref() without setting closed
+\* - UseFix = FALSE: getSnapshotData unlocks without retaining; Close clears map without setting closed.
+\* - UseFix = TRUE:  getSnapshotData retains underlying project.Snapshot under snapshotsMu.RLock()
+\*   and returns a release() closure calling Deref(); Close sets closed=TRUE under snapshotsMu.Lock();
+\*   registerSnapshot checks closed and immediately Deref()s if closed.
+
+CONSTANTS
+    UseFix \* BOOLEAN
 
 VARIABLES
     inMap,           \* BOOLEAN: handle S is in s.snapshots
-    refCount,        \* 0..2: sd.refCount
-    snapshotAlive,   \* BOOLEAN: sd.snapshot has not been Deref()'d to 0 (disposed)
+    clientRefs,      \* 0..2: sd.refCount (client-owned refs)
+    snapRefCount,    \* Int: underlying project.Snapshot atomic refCount (initial 1 owned by s.snapshots[S])
+    s2RefCount,      \* Int: underlying project.Snapshot refCount for in-flight S2 (0 before create, 1 when built)
     sessionClosed,   \* BOOLEAN: Session.Close() has run
-    \* Query handler goroutine
     queryPC,         \* "idle" | "using_snapshot" | "done"
-    \* CreateSnapshot goroutine (in-flight creating S2 during Close)
     createPC,        \* "idle" | "built_unregistered" | "done"
     s2InMap,         \* BOOLEAN: S2 inserted into s.snapshots
     \* Ghost violation flags
-    useAfterDeref,   \* TRUE if query is using sd.snapshot after it was disposed by Deref()
-    leakedAfterClose \* TRUE if S2 was registered into s.snapshots after Session.Close() completed
+    useAfterDeref,   \* TRUE if query uses sd.snapshot while snapRefCount <= 0
+    leakedAfterClose,\* TRUE if S2 was registered into s.snapshots after Session.Close()
+    negativeSnapRef  \* TRUE if Deref() dropped any snapshot refCount below 0
 
-vars == <<inMap, refCount, snapshotAlive, sessionClosed, queryPC, createPC, s2InMap,
-          useAfterDeref, leakedAfterClose>>
+vars == <<inMap, clientRefs, snapRefCount, s2RefCount, sessionClosed,
+          queryPC, createPC, s2InMap, useAfterDeref, leakedAfterClose, negativeSnapRef>>
 
 Init ==
     /\ inMap = TRUE
-    /\ refCount = 1
-    /\ snapshotAlive = TRUE
+    /\ clientRefs = 1
+    /\ snapRefCount = 1
+    /\ s2RefCount = 0
     /\ sessionClosed = FALSE
     /\ queryPC = "idle"
     /\ createPC = "idle"
     /\ s2InMap = FALSE
     /\ useAfterDeref = FALSE
     /\ leakedAfterClose = FALSE
+    /\ negativeSnapRef = FALSE
 
-\* getSnapshotData(S): reads s.snapshots[S] under RLock and unlocks WITHOUT bumping refCount!
+\* getSnapshotData(S)
 QueryStart ==
     /\ queryPC = "idle"
     /\ inMap
+    /\ snapRefCount' = IF UseFix THEN snapRefCount + 1 ELSE snapRefCount
     /\ queryPC' = "using_snapshot"
-    /\ UNCHANGED <<inMap, refCount, snapshotAlive, sessionClosed, createPC, s2InMap,
-                   useAfterDeref, leakedAfterClose>>
+    /\ UNCHANGED <<inMap, clientRefs, s2RefCount, sessionClosed, createPC, s2InMap,
+                   useAfterDeref, leakedAfterClose, negativeSnapRef>>
 
-\* Query dereferences sd.snapshot (e.g. getProgram / GetChecker / parseCache)
-QueryUseSnapshot ==
+\* Query uses sd.snapshot and (if UseFix) runs defer release() -> sd.snapshot.Deref()
+QueryUseAndRelease ==
     /\ queryPC = "using_snapshot"
-    /\ useAfterDeref' = (useAfterDeref \/ ~snapshotAlive)
+    /\ useAfterDeref' = (useAfterDeref \/ snapRefCount <= 0)
+    /\ IF UseFix
+       THEN /\ negativeSnapRef' = (negativeSnapRef \/ snapRefCount - 1 < 0)
+            /\ snapRefCount' = snapRefCount - 1
+       ELSE UNCHANGED <<negativeSnapRef, snapRefCount>>
     /\ queryPC' = "done"
-    /\ UNCHANGED <<inMap, refCount, snapshotAlive, sessionClosed, createPC, s2InMap,
-                   leakedAfterClose>>
+    /\ UNCHANGED <<inMap, clientRefs, s2RefCount, sessionClosed, createPC, s2InMap, leakedAfterClose>>
 
 \* handleRelease(S) -> releaseSnapshot(S)
 ReleaseS ==
     /\ inMap
-    /\ refCount' = refCount - 1
-    /\ IF refCount - 1 <= 0
+    /\ clientRefs' = clientRefs - 1
+    /\ IF clientRefs - 1 <= 0
        THEN /\ inMap' = FALSE
-            /\ snapshotAlive' = FALSE
-       ELSE UNCHANGED <<inMap, snapshotAlive>>
-    /\ UNCHANGED <<sessionClosed, queryPC, createPC, s2InMap, useAfterDeref, leakedAfterClose>>
+            /\ negativeSnapRef' = (negativeSnapRef \/ snapRefCount - 1 < 0)
+            /\ snapRefCount' = snapRefCount - 1
+       ELSE UNCHANGED <<inMap, negativeSnapRef, snapRefCount>>
+    /\ UNCHANGED <<s2RefCount, sessionClosed, queryPC, createPC, s2InMap, useAfterDeref, leakedAfterClose>>
 
-\* Concurrent createSnapshot starts building S2 before Close()
+\* Concurrent createSnapshot builds retained S2 (s2RefCount = 1) before Close()
 CreateStart ==
     /\ createPC = "idle"
     /\ ~sessionClosed
+    /\ s2RefCount' = 1
     /\ createPC' = "built_unregistered"
-    /\ UNCHANGED <<inMap, refCount, snapshotAlive, sessionClosed, queryPC, s2InMap,
-                   useAfterDeref, leakedAfterClose>>
+    /\ UNCHANGED <<inMap, clientRefs, snapRefCount, sessionClosed, queryPC, s2InMap,
+                   useAfterDeref, leakedAfterClose, negativeSnapRef>>
 
-\* registerSnapshot(S2): locks snapshotsMu, inserts S2 WITHOUT checking sessionClosed!
+\* registerSnapshot(S2)
 RegisterS2 ==
     /\ createPC = "built_unregistered"
-    /\ s2InMap' = TRUE
-    /\ leakedAfterClose' = (leakedAfterClose \/ sessionClosed)
+    /\ IF UseFix /\ sessionClosed
+       THEN \* Reject post-close registration and immediately Deref S2!
+            /\ negativeSnapRef' = (negativeSnapRef \/ s2RefCount - 1 < 0)
+            /\ s2RefCount' = s2RefCount - 1
+            /\ UNCHANGED <<s2InMap, leakedAfterClose>>
+       ELSE /\ s2InMap' = TRUE
+            /\ leakedAfterClose' = (leakedAfterClose \/ sessionClosed)
+            /\ UNCHANGED <<negativeSnapRef, s2RefCount>>
     /\ createPC' = "done"
-    /\ UNCHANGED <<inMap, refCount, snapshotAlive, sessionClosed, queryPC, useAfterDeref>>
+    /\ UNCHANGED <<inMap, clientRefs, snapRefCount, sessionClosed, queryPC, useAfterDeref>>
 
-\* Session.Close(): clears s.snapshots and Deref()s all entries, does NOT set closed!
+\* Session.Close(): drains and clears s.snapshots, calls Deref() on drained entries
 CloseSession ==
     /\ ~sessionClosed
     /\ sessionClosed' = TRUE
-    /\ inMap' = FALSE
-    /\ s2InMap' = FALSE
-    /\ snapshotAlive' = FALSE
-    /\ UNCHANGED <<refCount, queryPC, createPC, useAfterDeref, leakedAfterClose>>
+    /\ LET decS  == IF inMap THEN 1 ELSE 0
+           decS2 == IF s2InMap THEN 1 ELSE 0
+       IN
+       /\ negativeSnapRef' = (negativeSnapRef \/ (snapRefCount - decS < 0) \/ (s2RefCount - decS2 < 0))
+       /\ snapRefCount' = snapRefCount - decS
+       /\ s2RefCount' = s2RefCount - decS2
+       /\ inMap' = FALSE
+       /\ s2InMap' = FALSE
+    /\ UNCHANGED <<clientRefs, queryPC, createPC, useAfterDeref, leakedAfterClose>>
+
+AllDone ==
+    /\ sessionClosed
+    /\ queryPC \in {"idle", "done"}
+    /\ createPC \in {"idle", "done"}
+    /\ UNCHANGED vars
 
 Next ==
     \/ QueryStart
-    \/ QueryUseSnapshot
+    \/ QueryUseAndRelease
     \/ ReleaseS
     \/ CreateStart
     \/ RegisterS2
     \/ CloseSession
+    \/ AllDone
 
-NoUseAfterDeref == ~useAfterDeref
+NoUseAfterDeref  == ~useAfterDeref
 NoLeakAfterClose == ~leakedAfterClose
+NoNegativeSnapRef == ~negativeSnapRef
+
+\* At quiescence after CloseSession (with all in-flight queries and creates done),
+\* no snapshot remains in the map and all underlying snapshot refCounts reached 0!
+QuiescentClean ==
+    (sessionClosed /\ queryPC \in {"idle", "done"} /\ createPC \in {"idle", "done"}) =>
+        (~inMap /\ ~s2InMap /\ snapRefCount = 0 /\ s2RefCount = 0)
 
 =============================================================================

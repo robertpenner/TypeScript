@@ -80,6 +80,7 @@ run_case LspServerCancel        LspServerCancel        LspServerCancel.cfg      
 run_case LspServerCancel        LspServerCancel        LspServerCancel_Fixed.cfg               0
 run_case ApiSessionSnapshot     ApiSessionSnapshot     ApiSessionSnapshot_UAD.cfg             12
 run_case ApiSessionSnapshot     ApiSessionSnapshot     ApiSessionSnapshot_Leak.cfg            12
+run_case ApiSessionSnapshot     ApiSessionSnapshot     ApiSessionSnapshot_Fixed.cfg            0
 
 if [[ "$EXHAUSTIVE" -eq 1 ]]; then
   echo "=== Running long exhaustive negative checks ==="

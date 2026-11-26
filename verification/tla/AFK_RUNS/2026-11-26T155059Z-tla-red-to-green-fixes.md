@@ -20,8 +20,8 @@
 | --- | --- | --- | --- | --- | --- |
 | #4 | Fix lost global-diagnostics push notification (`project/session.go`) | integrated/verified | | `8f416ad` (PR #6) | TLC `SessionGlobalDiag_Fixed.cfg` 0 errors (72 distinct states, safety + liveness); `go test -race ./internal/project/...` 5/5 pkgs pass; `gofmt` + `go vet` clean |
 | #2 | Fix dropped `$/cancelRequest` for queued LSP requests (`lsp/server.go`) | integrated/verified | | `d9f6671` (PR #7) | TLC `LspServerCancel_Fixed.cfg` 0 errors (30 distinct states, deadlock-free); `go test -race ./internal/lsp/...` 3/3 pkgs pass; `gofmt` + `go vet` clean |
-| #3 | Fix `api.Session` snapshot use-after-deref & post-close leak (`api/session.go`) | in-progress | | | |
-| #5 | Redesign `dirty.SyncMap` entry lifecycle (`project/dirty/syncmap.go`) | ready | | | |
+| #3 | Fix `api.Session` snapshot use-after-deref & post-close leak (`api/session.go`) | integrated/verified | | `6b0b79b` (PR #8) | TLC `ApiSessionSnapshot_Fixed.cfg` 0 errors (36 distinct states, deadlock-free); `go test -race ./internal/api/...` 4/4 pkgs pass; `gofmt` + `go vet` clean |
+| #5 | Redesign `dirty.SyncMap` entry lifecycle (`project/dirty/syncmap.go`) | in-progress | | | |
 
 ### Verification evidence
 
@@ -36,6 +36,10 @@
   - TDD: `TestCancelRequestWhileQueuedInRequestQueue` failed before fix (`-32602 != -32800`), passed after fix (`0.00s`), alongside `TestCancelActiveRequestCancelsContext`.
   - `go -C ./tsc test -race -timeout=120s -count=1 ./internal/lsp/...`: 3/3 packages passed (`lsp`, `lsproto`, `lspwatcher`).
   - `gofmt -l` and `go vet ./internal/lsp/...`: clean.
+- Slice #3 (`fix/api-snapshot-lifecycle` `6b0b79b`, base `e0fce98`, PR #8):
+  - TLC `ApiSessionSnapshot_Fixed.cfg`: 0 errors (69 generated, 36 distinct states, deadlock checking enabled) verifying `NoUseAfterDeref`, `NoLeakAfterClose`, `NoNegativeSnapRef`, `QuiescentClean`.
+  - `go -C ./tsc test -race -timeout=180s -count=1 ./internal/api/...`: 4/4 packages passed (`api`, `encoder`, `requestfilesystem`, `wasmreactor`), including `TestGetSnapshotDataRetainsAcrossRelease`, `TestGetSnapshotDataRetainsAcrossSessionClose`, and `TestRegisterSnapshotAfterCloseRejectsAndDerefs`.
+  - `gofmt -l` and `go vet ./internal/api/...`: clean.
 
 ### Recovery
 
