@@ -9,7 +9,7 @@ Each finding is backed by:
 
 ## Documents
 
-- [`FINDINGS.md`](./FINDINGS.md): Component-by-component catalog of all 17 verified defects across 9 components (7 packages), plus 2 verified-safe negative results (`checkerPool` and balanced `RefCountCache.Deref`).
+- [`FINDINGS.md`](./FINDINGS.md): Component-by-component catalog of all 17 verified defects across 9 components (8 packages), plus 2 verified-safe negative results (`checkerPool` and balanced `RefCountCache.Deref`).
 - [`ANALYSIS.md`](./ANALYSIS.md): Severity and reachability triage, four recurring structural root-cause patterns, comparison against `project.checkerPool`, and architectural fix principles.
 
 ## Layout

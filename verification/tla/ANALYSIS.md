@@ -1,8 +1,18 @@
 # Architectural Analysis: Concurrency & State-Machine Defects in `tsc/internal`
 
-Pinned base commit: `e0fce98` (`microsoft/TypeScript` `main`).
-Scope audited so far: 10 concurrent components across 7 packages (`project/dirty`, `project`, `lsp/lspwatcher`, `fswatch`, `contentmapper`, `execute/tsc`, `lsp`, `api`).
-Summary count: **17 confirmed defects across 9 components**, all backed by minimal TLC counterexamples (3 to 16 states) and deterministic Go reproducers under `go test -race -timeout=15s`, plus **2 verified-safe negative results** (`project.checkerPool` and balanced `RefCountCache.Deref`).
+## Executive Summary
+
+We modeled 10 concurrent components across 8 Go packages in TypeScript 7 (`tsc/internal`, pinned at `e0fce98` on `microsoft/TypeScript` `main`) using official TLA+ (`tla2tools.jar` / TLC). Model checking uncovered **17 distinct concurrency and state-machine defects across 9 components**, and every defect is backed by a minimal 3- to 16-state TLC counterexample and a deterministic Go reproducer confirmed under `go test -race -timeout=15s` (19/19 reproducer tests failing as predicted against unmodified `tsc/internal` code).
+
+Six of those defects affect normal production paths:
+- A permanent two-goroutine AB-BA deadlock on cyclic tsconfig `extends` in both `execute/tsc` and `project` (`ExtendedConfigCache`).
+- Silently dropped `$/cancelRequest` notifications in `lsp.Server` whenever a request is still sitting in `requestQueue` behind edits.
+- Use-after-deref across 480+ concurrent `api.Session` read handlers (plus a post-close snapshot leak).
+- Lost global-diagnostics push notifications in `project.Session`, lost file-watch triggers for newly registered watches in `fswatch.debounce`, and stale termination callbacks closing live watches in `lspwatcher`.
+
+The remaining defects live in shared concurrent primitives (`dirty.SyncMap`, `RefCountCache`, `contentmapper.host`, and `lspwatcher.Watcher`), including a live `-race` data race, a nil-pointer panic, silently dropped deletions, TOCTOU conditional writes, orphaned child processes, and zero-value cache resurrection.
+
+Every defect traces back to the same underlying design pattern: splitting one logical state transition across multiple synchronization domains (two mutexes, `collections.SyncMap` plus per-entry `sync.Mutex`, an `atomic.Bool` plus a mutex, or an unlocked I/O/RPC window) without carrying explicit lifecycle state or object identity across the gap. By contrast, `project.checkerPool` passed 26.9M+ TLC states with zero violations because one mutex owns all mutable state, blocking happens only on bounded semaphores outside the lock, and re-entry validates object identity. Existing Go tests in all 8 packages missed these bugs because they tested single-operation races rather than cross-operation interleavings.
 
 ---
 
@@ -86,7 +96,7 @@ Every defect across all 9 buggy components stems from one of four structural mec
 
 ## 4. Value of TLA+ Alongside Existing Go Testing
 
-Every one of the 7 affected packages already has unit tests, `-race` runs, and in several cases dedicated concurrency tests (`TestSyncMapProxyFor`, `TestExtendedConfigCacheExtendsCircularity`, `TestRefCountCacheAcquireExistingRacesFinalRelease`). Those tests checked the races the authors anticipated (`Change` vs `Change`, single-goroutine mutual `extends`, `AcquireExisting` vs `Deref` with `DisableDeletion: false`).
+Every one of the 8 affected packages already has unit tests, `-race` runs, and in several cases dedicated concurrency tests (`TestSyncMapProxyFor`, `TestExtendedConfigCacheExtendsCircularity`, `TestRefCountCacheAcquireExistingRacesFinalRelease`). Those tests checked the races the authors anticipated (`Change` vs `Change`, single-goroutine mutual `extends`, `AcquireExisting` vs `Deref` with `DisableDeletion: false`).
 
 TLC found defects in the **cross-product of operations** that hand-written tests rarely combine:
 - `m.Delete` vs `e.Change` (6 states)

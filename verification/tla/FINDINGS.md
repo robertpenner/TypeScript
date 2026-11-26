@@ -219,7 +219,7 @@ All TLA+ specs, TLC configurations, and Go reproducers live in this directory ([
 
 ## Architectural Synthesis (Shared Root Cause)
 
-Every verified bug across all 9 families (17 distinct defects across 7 packages) stems from one of four concrete structural mechanisms where a logical state transition is split across synchronization domains without preserving explicit lifecycle phases or object identity across the gap:
+Every verified bug across all 9 families (17 distinct defects across 8 packages) stems from one of four concrete structural mechanisms where a logical state transition is split across synchronization domains without preserving explicit lifecycle phases or object identity across the gap:
 
 1. **Multi-domain split with reset-after-read or bypass:** `Session.globalDiagPublishPending` (`atomic.Bool` cleared via `defer` after scanning `checkerPool.mu`), `fswatch.debounce` (`d.mu` callback snapshot separated from `d.latchMu` reset), `lsp.Server` (`$/cancelRequest` checking `pendingClientRequestsMu` while requests sit in `requestQueue`).
 2. **Lock-drop around I/O, RPC, or recursion without re-validating entry identity/state:** `lspwatcher.Watcher.WatchFiles` (re-acquires `w.mu` without checking `id` still exists), `lspwatcher.watch.handleTerminated` (closes `w.subscription` without checking subscription identity), `contentmapper.projectLease.Transform` (drops `h.mu` before `transformLocked` / `connFor`, racing `Refresh` and `Close`), `api.Session.getSnapshotData` & `registerSnapshot` (drops `snapshotsMu` without retaining or checking `closed`).
