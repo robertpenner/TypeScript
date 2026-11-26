@@ -5828,9 +5828,6 @@ func (s *Session) createSnapshotOperationResponse(snapshot *project.Snapshot, re
 // regardless of their ref counts.
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
-		s.releaseLanguageServerRefs()
-		s.releaseSourceFileLeases()
-
 		s.snapshotsMu.Lock()
 		s.closed = true
 		snapshots := make([]*project.Snapshot, 0, len(s.snapshots))
@@ -5839,6 +5836,10 @@ func (s *Session) Close() {
 		}
 		clear(s.snapshots)
 		s.snapshotsMu.Unlock()
+
+		s.releaseLanguageServerRefs()
+		s.releaseSourceFileLeases()
+
 		for _, snapshot := range snapshots {
 			snapshot.Deref()
 		}
