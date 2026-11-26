@@ -2,7 +2,7 @@
 
 Branch: `tla-tier2-investigation` (base `3421f17`)
 Worktree: `/workspaces/robertpenner/TypeScript-tla-tier2`
-Companion reports: [`FINDINGS.md`](./FINDINGS.md) (Tier 1), [`ANALYSIS.md`](./ANALYSIS.md) (Tier 1 architecture analysis), [`FINDINGS-TIER2.md`](./FINDINGS-TIER2.md) (Tier 2 findings)
+Companion reports: [`FINDINGS.md`](./FINDINGS.md) (Tier 1), [`ANALYSIS.md`](./ANALYSIS.md) (Tier 1 architecture analysis), [`FINDINGS-TIER2.md`](./FINDINGS-TIER2.md) (Tier 2 findings), [`GO-ARCHITECTURE.md`](./GO-ARCHITECTURE.md) (target Go concurrency architecture)
 
 ## Overview
 
