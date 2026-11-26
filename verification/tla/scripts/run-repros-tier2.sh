@@ -8,6 +8,8 @@ TSC_DIR="$ROOT/tsc"
 TMP_FILES=(
   "$TSC_DIR/internal/fswatch/tla_repro_tmp_test.go"
   "$TSC_DIR/internal/execute/build/tla_repro_tmp_test.go"
+  "$TSC_DIR/internal/project/tla_repro_ownercache_tmp_test.go"
+  "$TSC_DIR/internal/project/tla_repro_session_tmp_test.go"
 )
 
 cleanup() {
@@ -17,6 +19,8 @@ trap cleanup EXIT
 
 cp "$REPRO_DIR/fswatch_lifecycle_repro_test.go"        "$TSC_DIR/internal/fswatch/tla_repro_tmp_test.go"
 cp "$REPRO_DIR/build_orchestrator_watch_repro_test.go" "$TSC_DIR/internal/execute/build/tla_repro_tmp_test.go"
+cp "$REPRO_DIR/ownercache_release_repro_test.go"       "$TSC_DIR/internal/project/tla_repro_ownercache_tmp_test.go"
+cp "$REPRO_DIR/session_project_repro_test.go"          "$TSC_DIR/internal/project/tla_repro_session_tmp_test.go"
 
 # Format: "<pkg>|<test-regex>|<mode>"
 #   mode=fail  -> expects --- FAIL: TestRepro...
@@ -25,6 +29,13 @@ CASES=(
   "./internal/fswatch|^TestReproFSWatchLifecycleDeadDebounceAndOrphanedWatch$|fail"
   "./internal/execute/build|^TestReproBuildWatchUnresolvedProjectDoubleClosePanic$|crash"
   "./internal/execute/build|^TestReproBuildWatchDownstreamUnboundedDuplicationAndStaleRetention$|fail"
+  "./internal/project|^TestReproOwnerCacheReleaseBlindDeleteCausesAddOwnerPanic$|fail"
+  "./internal/project|^TestReproSessionWatchLeakedClientWatchOnAddRemove$|fail"
+  "./internal/project|^TestReproSessionWatchConcurrentAcquireFailStrandsLiveProject$|fail"
+  "./internal/project|^TestReproSessionWatchFailedThenRemovedStealsLiveWatch$|fail"
+  "./internal/project|^TestReproSessionProgramDiagOutOfOrderStaleOverwrite$|fail"
+  "./internal/project|^TestReproSessionDidChangeInferredOptionsDataRace$|crash"
+  "./internal/project|^TestReproSessionDidChangeInferredOptionsNilSnapshotPanic$|fail"
 )
 
 total_reproduced=0

@@ -57,5 +57,12 @@ run_case FSWatchLifecycle       FSWatchLifecycle       FSWatchLifecycle_NoOSSub.
 run_case FSWatchLifecycle       FSWatchLifecycle       FSWatchLifecycle_Orphaned.cfg               12
 run_case BuildOrchestratorWatch BuildOrchestratorWatch BuildOrchestratorWatch_DoubleClose.cfg      12
 run_case BuildOrchestratorWatch BuildOrchestratorWatch BuildOrchestratorWatch_StaleDownstream.cfg  12
+run_case OwnerCacheRelease      OwnerCacheRelease      OwnerCacheRelease.cfg                       12
+run_case SessionWatchProtocol   SessionWatchProtocol   SessionWatchProtocol_AddRemove.cfg          12
+run_case SessionWatchProtocol   SessionWatchProtocol   SessionWatchProtocol_ConcurrentFail.cfg     12
+run_case SessionWatchProtocol   SessionWatchProtocol   SessionWatchProtocol_FailThenRemove.cfg     12
+run_case SessionProgramDiag     SessionProgramDiag     SessionProgramDiag.cfg                      12
+run_case SessionInferredOptions SessionInferredOptions SessionInferredOptions_LostOverlay.cfg      12
+run_case SessionInferredOptions SessionInferredOptions SessionInferredOptions_NilClone.cfg         12
 
 echo "=== All expected Tier 2 TLC verdicts matched ==="

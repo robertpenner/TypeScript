@@ -46,19 +46,19 @@ Tier 2 targets the highest-risk concurrent protocols outside Tier 1: file-watch 
   - `BuildOrchestratorWatch` (2 invariants): unresolved projects (`task.resolved == nil`) in `tsc -b -w` retain closed `done`/`built` channels across watch cycles, causing a `-race` data race on `task.result`, SIGSEGV in `(*BuildTask).report`, and `panic: close of closed channel`; config reloads (`GenerateGraphReusingOldTasks`) clear `task.upStream` on reused tasks without clearing `task.downStream`, leaking stale `*BuildTask` graphs unboundedly.
 - **Verified-safe negative checks:** `computeScheduleOrder` / `waitOnUpstream` DAG scheduling; `contentmapper` lease `sync.Once` close.
 
-#### Target 2: `project` Session, Watch Registry, Caches, and ATA (In Progress)
+#### Target 2: `project` Session, Watch Registry, Caches, and ATA (Complete)
 
 `tsc/internal/project` has the highest synchronization density in `tsc/internal` (44 sync primitives across 16 non-test files, 14 in `session.go` alone).
 
-- **Scope:** `session.go`, `watch.go`, `ownercache.go`, `snapshot.go`, `snapshotfs.go`, `overlayfs.go`, `programcounter.go`, `background/queue.go`, `ata/ata.go` (excluding `SessionGlobalDiag` and `DirtySyncMap` covered in Tier 1).
-- **Concrete leads identified in code audit, next up for TLA+ specs and `-race` reproducers:**
-  1. **`OwnerCache.Release` blind delete (`ownercache.go:79-91`, `snapshot.go:728-735, 797-804`):** `Release` calls `c.entries.Delete(identity)` without verifying map-entry identity or whether `owner` was present. When two configs in a snapshot extend the same base config, `Snapshot.dispose` calls `Release` twice for the same snapshot ID. Under concurrent snapshot disposal and re-acquisition, the second `Release` wakes up on the emptied old entry and deletes the newly acquired live entry, causing the next `Clone` to panic with `OwnerCache.AddOwner: entry not found`.
-  2. **Unserialized `Session.updateSnapshot` background tasks (`session.go:1428-1455`):** `background.Queue.Enqueue` spawns an unbounded concurrent goroutine per task. Unlike `updateContentMapperRegistrations` (which serializes with `contentMapperRegistrationMu` and checks `snapshot.ID()`), `updateWatches` and `publishProgramDiagnostics` run concurrently and out of order:
-     - `updateWatches` / `watchRegistry` (`session.go:1510-1595`, `watch.go:34-100`): unwatch-before-watch leaks client watchers; `Acquire`/`Release` vs client RPC reordering leaves the client watching entries the registry deleted; partial-failure rollback after a concurrent `Acquire` decrements refcount from 2 to 1 without registering with the client, silently stranding a live project unwatched.
-     - `publishProgramDiagnostics` (`session.go:1902-1965`): an older snapshot's background task can overwrite a newer snapshot's cleared diagnostics with stale errors.
-  3. **Secondary checks to finish in Target 2:** `DidChangeCompilerOptionsForInferredProjects` calling `UpdateSnapshot` without `snapshotUpdateMu` (`session.go:502-509`), concurrent ATA completion overwrites in `triggerATAForUpdatedProjects` (`session.go:2050-2060`), and `background.Queue.Wait()` vs `Enqueue()` reachability.
+- **Audited files:** `session.go`, `watch.go`, `ownercache.go`, `snapshot.go`, `snapshotfs.go`, `overlayfs.go`, `project.go`, `checkerpool.go`, `background/queue.go`, `ata/ata.go` (excluding `SessionGlobalDiag` and `DirtySyncMap` covered in Tier 1).
+- **Verified defects (4 TLA+ specs, 7 TLC violations, 7 confirmed Go `-race` reproducers, all novel upstream):**
+  1. `OwnerCacheRelease` (`InvNoAddOwnerPanic`): `OwnerCache.Release` blindly deletes `identity` from `c.entries` without verifying map-entry identity or prior owner membership; duplicate `Release` calls from `Snapshot.dispose` (when two configs extend the same base config) can evict a newly acquired live entry, causing `Clone` -> `OwnerCache.AddOwner` to panic with `entry not found`.
+  2. `SessionWatchProtocol` (3 invariants: `InvNoLeakedClientWatch`, `InvActiveWatcherCovered`, `InvLiveWatcherNotStolen`): unserialized `backgroundQueue` watch updates leak client watches on add/remove RPC inversion; concurrent `Acquire` + partial-failure rollback leaves live projects unwatched with stuck refcount 1; removing (or retrying) a failed/rolled-back watcher does not check `IsPending` and double-releases shared globs, calling `UnwatchFiles` on another live project's watch.
+  3. `SessionProgramDiag` (`InvFinalDiagnosticsMatchLatest`): unserialized `publishProgramDiagnostics` on `backgroundQueue` lets an older snapshot overwrite a newer snapshot's cleared `tsconfig.json` diagnostics with stale errors.
+  4. `SessionInferredOptions` (2 invariants: `InvNoLostOverlay`, `InvNoNilSnapshotClone`): `DidChangeCompilerOptionsForInferredProjects` skips `s.snapshotUpdateMu`, causing a live Go `-race` data race on `s.compilerOptionsForInferredProjects`, stale-overlay overwrite against concurrent `DidOpenFile`, and a nil-pointer dereference panic in `oldSnapshot.Clone` when racing with or called after `Session.Close()`.
+- **Verified-safe negative checks:** `publishProgramDiagnostics` vs `checkerPool.Discard()`; `updateContentMapperRegistrations` (`contentMapperRegistrationMu` + monotonic `snapshot.ID()` guard); `background.Queue` `Enqueue`/`Close` `WaitGroup` protocol.
 
-#### Target 3: `lsp` Server Lifecycle, Queueing, and Progress (Queued)
+#### Target 3: `lsp` Server Lifecycle, Queueing, and Progress (In Progress)
 
 `tsc/internal/lsp` has 12 sync primitives across `server.go`, `dynamic_queue.go`, and `progress.go` (excluding `$/cancelRequest` queue residency covered in Tier 1 `LspServerCancel`).
 
