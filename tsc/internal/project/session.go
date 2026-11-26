@@ -193,11 +193,18 @@ type Session struct {
 	// are using each glob.
 	watches *watchRegistry
 
-	// globalDiagPublishPending is set to true when a global diagnostics publish
-	// task should be enqueued. It is reset when the task runs, coalescing multiple
-	// requests into a single background task.
-	globalDiagPublishPending atomic.Bool
+	// globalDiagPublishState coordinates background global-diagnostics publishing
+	// via a three-state latch (idle, running, rerun). At most one publish task
+	// runs at a time, and any enqueue arriving while a pass is in flight marks
+	// rerun so the running task drains the new diagnostics before exiting.
+	globalDiagPublishState atomic.Int32
 }
+
+const (
+	globalDiagPublishIdle int32 = iota
+	globalDiagPublishRunning
+	globalDiagPublishRerun
+)
 
 // newContentMapperHost creates the session's shared content mapper host when the workspace is trusted and
 // a spawner is available; otherwise it returns nil, and configured content mappers are rejected by the
@@ -2001,14 +2008,43 @@ func (s *Session) EnqueuePublishGlobalDiagnostics() {
 	if !s.options.PushDiagnosticsEnabled || s.Config().ValidateEnabled.IsFalse() {
 		return
 	}
-	if s.globalDiagPublishPending.CompareAndSwap(false, true) {
-		s.backgroundQueue.Enqueue(s.backgroundContext(), s.publishGlobalDiagnostics)
+	ctx := s.backgroundContext()
+	if ctx.Err() != nil {
+		return
+	}
+	for {
+		switch s.globalDiagPublishState.Load() {
+		case globalDiagPublishIdle:
+			if s.globalDiagPublishState.CompareAndSwap(globalDiagPublishIdle, globalDiagPublishRunning) {
+				s.backgroundQueue.Enqueue(ctx, s.publishGlobalDiagnostics)
+				return
+			}
+		case globalDiagPublishRunning:
+			if s.globalDiagPublishState.CompareAndSwap(globalDiagPublishRunning, globalDiagPublishRerun) {
+				return
+			}
+		case globalDiagPublishRerun:
+			return
+		}
 	}
 }
 
 func (s *Session) publishGlobalDiagnostics(ctx context.Context) {
-	defer s.globalDiagPublishPending.Store(false)
+	for {
+		s.publishGlobalDiagnosticsOnce(ctx)
 
+		if s.globalDiagPublishState.CompareAndSwap(globalDiagPublishRunning, globalDiagPublishIdle) {
+			return
+		}
+		if ctx.Err() != nil {
+			s.globalDiagPublishState.Store(globalDiagPublishIdle)
+			return
+		}
+		s.globalDiagPublishState.Store(globalDiagPublishRunning)
+	}
+}
+
+func (s *Session) publishGlobalDiagnosticsOnce(ctx context.Context) {
 	s.snapshotMu.RLock()
 	snapshot := s.snapshot
 	snapshot.ref()

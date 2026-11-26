@@ -1334,3 +1334,98 @@ func TestCheckerPoolCleanupAfterDiscardIsNoop(t *testing.T) {
 		pool.mu.Unlock()
 	})
 }
+
+type blockingGlobalDiagClient struct {
+	noopClient
+	armed        atomic.Bool
+	publishCalls atomic.Int32
+	inFlight     atomic.Int32
+	maxInFlight  atomic.Int32
+	inFirstSend  chan struct{}
+	releaseSend  chan struct{}
+}
+
+func (c *blockingGlobalDiagClient) PublishDiagnostics(_ context.Context, _ *lsproto.PublishDiagnosticsParams) error {
+	if !c.armed.Load() {
+		return nil
+	}
+	cur := c.inFlight.Add(1)
+	defer c.inFlight.Add(-1)
+	for {
+		prev := c.maxInFlight.Load()
+		if cur <= prev || c.maxInFlight.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
+	if c.publishCalls.Add(1) == 1 {
+		close(c.inFirstSend)
+		<-c.releaseSend
+	}
+	return nil
+}
+
+func TestSessionEnqueuePublishGlobalDiagnosticsDuringInFlightPublish(t *testing.T) {
+	t.Parallel()
+	if !bundled.Embedded {
+		t.Skip("bundled files are not embedded")
+	}
+
+	files := map[string]any{
+		"/src/tsconfig.json": `{ "compilerOptions": { "noLib": true } }`,
+		"/src/index.ts":      "export const x: number = 1;",
+	}
+	fs := bundled.WrapFS(vfstest.FromMap(files, tspath.CaseInsensitive))
+	client := &blockingGlobalDiagClient{
+		inFirstSend: make(chan struct{}),
+		releaseSend: make(chan struct{}),
+	}
+	session := NewSession(&SessionInit{
+		BackgroundCtx: context.Background(),
+		Options: &SessionOptions{
+			CurrentDirectory:       "/",
+			DefaultLibraryPath:     bundled.LibPath(),
+			PositionEncoding:       lsproto.PositionEncodingKindUTF8,
+			WatchEnabled:           false,
+			PushDiagnosticsEnabled: true,
+			CheckerPoolOptions:     CheckerPoolOptions{MaxCheckers: 2, IdleTimeout: time.Minute},
+		},
+		FS:     fs,
+		Client: client,
+		Logger: logging.NewTestLogger(),
+	})
+	defer session.Close()
+
+	session.DidOpenFile(context.Background(), "file:///src/index.ts", 1, "export const x: number = 1;", lsproto.LanguageKindTypeScript)
+	session.WaitForBackgroundTasks()
+	snap := session.Snapshot()
+	proj := snap.ProjectCollection.ConfiguredProject("/src/tsconfig.json")
+	assert.Assert(t, proj != nil && proj.checkerPool != nil)
+
+	client.armed.Store(true)
+
+	// Signal global diagnostics #1 and pause while PublishDiagnostics RPC is in flight.
+	proj.checkerPool.mu.Lock()
+	proj.checkerPool.globalDiagChanged = true
+	proj.checkerPool.mu.Unlock()
+	session.EnqueuePublishGlobalDiagnostics()
+	<-client.inFirstSend
+
+	// While RPC #1 is in flight, global diagnostics #2 arrive and trigger EnqueuePublishGlobalDiagnostics.
+	proj.checkerPool.mu.Lock()
+	proj.checkerPool.globalDiagChanged = true
+	proj.checkerPool.mu.Unlock()
+	session.EnqueuePublishGlobalDiagnostics()
+	// Coalesce a duplicate call while already marked for rerun.
+	session.EnqueuePublishGlobalDiagnostics()
+
+	close(client.releaseSend)
+	session.WaitForBackgroundTasks()
+
+	proj.checkerPool.mu.Lock()
+	stillUnpublished := proj.checkerPool.globalDiagChanged
+	proj.checkerPool.mu.Unlock()
+
+	assert.Assert(t, !stillUnpublished, "global diagnostics produced during in-flight publish must be drained")
+	assert.Equal(t, client.publishCalls.Load(), int32(2), "follow-up publish pass must run once for coalesced updates")
+	assert.Equal(t, client.maxInFlight.Load(), int32(1), "global diagnostic publish passes must not overlap")
+}
