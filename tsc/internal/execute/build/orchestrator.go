@@ -217,6 +217,7 @@ func (o *Orchestrator) createBuildTasks(ctx context.Context, oldTasks *collectio
 			}
 			task.resolved = o.host.GetResolvedProjectReference(config, path)
 			task.upStream = nil
+			task.downStream = nil
 			if task.resolved != nil {
 				o.createBuildTasks(ctx, oldTasks, task.resolved.ResolvedProjectReferencePaths(), wg)
 			}
@@ -268,7 +269,9 @@ func (o *Orchestrator) setupBuildTask(
 		o.order = append(o.order, task)
 	}
 	if o.opts.Command.CompilerOptions.Watch.IsTrue() && downStream != nil {
-		task.downStream = append(task.downStream, downStream)
+		if !slices.Contains(task.downStream, downStream) {
+			task.downStream = append(task.downStream, downStream)
+		}
 	}
 	return task
 }
@@ -985,6 +988,10 @@ func (o *Orchestrator) buildOrCleanOrder(ctx context.Context, order []*BuildTask
 		if ctx.Err() != nil {
 			buildResult.Result.Status = tsc.ExitStatusCancelled
 			return buildResult
+		}
+		for _, task := range order {
+			task.built = make(chan struct{})
+			task.done = make(chan struct{})
 		}
 		// Builders pick up selected projects in dependency-depth order; reporting preserves the selected build order.
 		reported := make(chan struct{})
