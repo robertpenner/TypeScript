@@ -233,7 +233,11 @@ type Server struct {
 
 	// initComplete is closed when handleInitialized completes.
 	// Used by tests to wait for full initialization.
-	initComplete chan struct{}
+	initComplete     chan struct{}
+	initCompleteOnce sync.Once
+	initialized      bool
+	shutdown         bool
+	asyncRequests    sync.WaitGroup
 
 	// !!! temporary; remove when we have `handleDidChangeConfiguration`/implicit project config support
 	compilerOptionsForInferredProjects *core.CompilerOptions
@@ -1015,6 +1019,18 @@ func (s *Server) cancelRequest(rawID lsproto.IntegerOrString) {
 	}
 }
 
+func (s *Server) cancelPendingClientRequestsExcept(keepID *jsonrpc.ID) {
+	s.pendingClientRequestsMu.Lock()
+	defer s.pendingClientRequestsMu.Unlock()
+	for id, pendingReq := range s.pendingClientRequests {
+		if keepID != nil && id == *keepID {
+			continue
+		}
+		pendingReq.cancel()
+		delete(s.pendingClientRequests, id)
+	}
+}
+
 func (s *Server) read() (*lsproto.Message, error) {
 	return s.r.Read()
 }
@@ -1068,7 +1084,9 @@ func (s *Server) dispatchLoop(ctx context.Context) error {
 			handleError(err)
 			removeRequest()
 		} else if doAsyncWork != nil {
+			s.asyncRequests.Add(1)
 			go func() {
+				defer s.asyncRequests.Done()
 				if lsError := doAsyncWork(); lsError != nil {
 					handleError(lsError)
 				}
@@ -1196,6 +1214,24 @@ func (s *Server) send(msg *lsproto.Message) error {
 // handleRequestOrNotification looks up the handler for the given request or notification, executes its synchronous work
 // and returns any asynchronous work as a function to be executed by the caller.
 func (s *Server) handleRequestOrNotification(ctx context.Context, req *lsproto.RequestMessage) (func() error, error) {
+	if s.shutdown {
+		if req.Method != lsproto.MethodExit {
+			if req.ID != nil {
+				return nil, lsproto.ErrorCodeInvalidRequest
+			}
+			return nil, nil
+		}
+	} else if s.session == nil {
+		switch req.Method {
+		case lsproto.MethodInitialize, lsproto.MethodInitialized, lsproto.MethodShutdown, lsproto.MethodExit:
+		default:
+			if req.ID != nil {
+				return nil, lsproto.ErrorCodeServerNotInitialized
+			}
+			return nil, nil
+		}
+	}
+
 	ctx = lsproto.WithClientCapabilities(ctx, &s.clientCapabilities)
 
 	if handler := handlers()[req.Method]; handler != nil {
@@ -1371,10 +1407,6 @@ var handlers = sync.OnceValue(func() handlerMap {
 
 func (handlers handlerMap) registerNotificationHandler[Req any](info lsproto.NotificationInfo[Req], fn func(*Server, context.Context, Req) error) {
 	handlers[info.Method] = func(s *Server, ctx context.Context, req *lsproto.RequestMessage) (func() error, error) {
-		if s.session == nil && req.Method != lsproto.MethodInitialized {
-			return nil, lsproto.ErrorCodeServerNotInitialized
-		}
-
 		params, err := req.UnmarshalParams[Req]()
 		if err != nil {
 			return nil, err
@@ -1391,10 +1423,6 @@ func (handlers handlerMap) registerRequestHandler[Req, Resp any](
 	fn func(*Server, context.Context, Req, *lsproto.RequestMessage) (Resp, error),
 ) {
 	handlers[info.Method] = func(s *Server, ctx context.Context, req *lsproto.RequestMessage) (func() error, error) {
-		if s.session == nil && req.Method != lsproto.MethodInitialize {
-			return nil, lsproto.ErrorCodeServerNotInitialized
-		}
-
 		params, err := req.UnmarshalParams[Req]()
 		if err != nil {
 			return nil, err
@@ -1747,6 +1775,11 @@ func (s *Server) handleInitialize(ctx context.Context, params *lsproto.Initializ
 }
 
 func (s *Server) handleInitialized(ctx context.Context, params *lsproto.InitializedParams) error {
+	if s.initialized {
+		return nil
+	}
+	s.initialized = true
+
 	var disablePushDiagnostics bool
 	var enableTelemetry bool
 	if s.initializationOptions.DisablePushDiagnostics != nil {
@@ -1876,16 +1909,25 @@ func (s *Server) handleInitialized(ctx context.Context, params *lsproto.Initiali
 
 	s.session.StartPerformanceTelemetry()
 
-	close(s.initComplete)
+	s.initCompleteOnce.Do(func() {
+		close(s.initComplete)
+	})
 	return nil
 }
 
-func (s *Server) handleShutdown(ctx context.Context, _ lsproto.NoParams, _ *lsproto.RequestMessage) (lsproto.ShutdownResponse, error) {
+func (s *Server) handleShutdown(ctx context.Context, _ lsproto.NoParams, req *lsproto.RequestMessage) (lsproto.ShutdownResponse, error) {
+	s.shutdown = true
+	s.cancelPendingClientRequestsExcept(req.ID)
+	s.asyncRequests.Wait()
 	if s.builtinWatcher != nil {
 		s.builtinWatcher.Close()
+		s.builtinWatcher = nil
 	}
 	s.closeAPISessions()
-	s.session.Close()
+	if s.session != nil {
+		s.session.Close()
+		s.session = nil
+	}
 	return lsproto.ShutdownResponse{}, nil
 }
 
