@@ -3,45 +3,60 @@ EXTENDS Integers
 
 \* Faithful model of Session.EnqueuePublishGlobalDiagnostics / publishGlobalDiagnostics
 \* (tsc/internal/project/session.go:1998-2024) + checkerPool.TakeNewGlobalDiagnostics
-\* (tsc/internal/project/checkerpool.go:405-425) + background.Queue.Enqueue.
+\* (tsc/internal/project/checkerpool.go:405-425).
+\*
+\* UseFix = FALSE: buggy atomic.Bool cleared by defer at function exit.
+\* UseFix = TRUE:  3-state atomic latch (0=idle, 1=running, 2=rerun) with single-worker rerun loop.
 
 CONSTANTS
-    MaxEvents \* Max number of new global diagnostic events to produce, e.g. 2
+    MaxEvents, \* Max number of new global diagnostic events to produce, e.g. 3
+    UseFix     \* BOOLEAN: FALSE models buggy defer latch, TRUE models 3-state rerun loop
+
+IDLE    == 0
+RUNNING == 1
+RERUN   == 2
 
 VARIABLES
-    \* CheckerPool state
-    producedCount,    \* 0..MaxEvents: total global diagnostics produced by checker 0
+    producedCount,    \* 0..MaxEvents: total global diagnostics accumulated in checkerPool
     globalDiagChanged,\* BOOLEAN: checkerPool.globalDiagChanged
-    \* Session state
-    publishPending,   \* BOOLEAN: Session.globalDiagPublishPending
+    publishState,     \* IDLE (0) | RUNNING (1) | RERUN (2)
     publishedCount,   \* 0..MaxEvents: latest global diagnostics count actually published to client
-    \* Background worker state
-    workerPC,         \* "idle" | "queued" | "took_flag" | "read_diags" | "sent_rpc"
+    workerPC,         \* "idle" | "queued" | "took_flag" | "read_diags" | "sent_rpc" | "reset_rerun"
     workerSawChange,  \* BOOLEAN: return value of TakeNewGlobalDiagnostics()
-    workerDiagSnap    \* 0..MaxEvents: snapshot read by GetProjectDiagnostics()
+    workerDiagSnap,   \* 0..MaxEvents: snapshot read by GetProjectDiagnostics()
+    outOfOrderPublish \* BOOLEAN: TRUE if a publish sent a smaller count than already published
 
-vars == <<producedCount, globalDiagChanged, publishPending, publishedCount,
-          workerPC, workerSawChange, workerDiagSnap>>
+vars == <<producedCount, globalDiagChanged, publishState, publishedCount,
+          workerPC, workerSawChange, workerDiagSnap, outOfOrderPublish>>
 
 Init ==
     /\ producedCount = 0
     /\ globalDiagChanged = FALSE
-    /\ publishPending = FALSE
+    /\ publishState = IDLE
     /\ publishedCount = 0
     /\ workerPC = "idle"
     /\ workerSawChange = FALSE
     /\ workerDiagSnap = 0
+    /\ outOfOrderPublish = FALSE
 
 \* Diagnostics checker finishes, merges new global diag, calls EnqueuePublishGlobalDiagnostics().
 ProduceGlobalDiagAndEnqueue ==
     /\ producedCount < MaxEvents
     /\ producedCount' = producedCount + 1
     /\ globalDiagChanged' = TRUE
-    /\ IF ~publishPending
-       THEN /\ publishPending' = TRUE
-            /\ workerPC' = "queued"
-       ELSE /\ UNCHANGED <<publishPending, workerPC>>
-    /\ UNCHANGED <<publishedCount, workerSawChange, workerDiagSnap>>
+    /\ IF ~UseFix
+       THEN IF publishState = IDLE
+            THEN /\ publishState' = RUNNING
+                 /\ workerPC' = "queued"
+            ELSE UNCHANGED <<publishState, workerPC>>
+       ELSE IF publishState = IDLE
+            THEN /\ publishState' = RUNNING
+                 /\ workerPC' = "queued"
+            ELSE IF publishState = RUNNING
+            THEN /\ publishState' = RERUN
+                 /\ UNCHANGED workerPC
+            ELSE UNCHANGED <<publishState, workerPC>>
+    /\ UNCHANGED <<publishedCount, workerSawChange, workerDiagSnap, outOfOrderPublish>>
 
 \* publishGlobalDiagnostics calls project.checkerPool.TakeNewGlobalDiagnostics()
 WorkerTakeFlag ==
@@ -49,7 +64,7 @@ WorkerTakeFlag ==
     /\ workerSawChange' = globalDiagChanged
     /\ globalDiagChanged' = FALSE
     /\ workerPC' = "took_flag"
-    /\ UNCHANGED <<producedCount, publishPending, publishedCount, workerDiagSnap>>
+    /\ UNCHANGED <<producedCount, publishState, publishedCount, workerDiagSnap, outOfOrderPublish>>
 
 \* If TakeNewGlobalDiagnostics() returned TRUE, calls project.GetProjectDiagnostics(ctx)
 WorkerReadDiags ==
@@ -59,33 +74,59 @@ WorkerReadDiags ==
             /\ workerPC' = "read_diags"
        ELSE /\ workerPC' = "sent_rpc"
             /\ UNCHANGED workerDiagSnap
-    /\ UNCHANGED <<producedCount, globalDiagChanged, publishPending, publishedCount, workerSawChange>>
+    /\ UNCHANGED <<producedCount, globalDiagChanged, publishState, publishedCount, workerSawChange, outOfOrderPublish>>
 
-\* Sends PublishDiagnostics RPC to client (while globalDiagPublishPending is still TRUE!)
+\* Sends PublishDiagnostics RPC to client
 WorkerSendRPC ==
     /\ workerPC = "read_diags"
+    /\ outOfOrderPublish' = (outOfOrderPublish \/ workerDiagSnap < publishedCount)
     /\ publishedCount' = workerDiagSnap
     /\ workerPC' = "sent_rpc"
-    /\ UNCHANGED <<producedCount, globalDiagChanged, publishPending, workerSawChange, workerDiagSnap>>
+    /\ UNCHANGED <<producedCount, globalDiagChanged, publishState, workerSawChange, workerDiagSnap>>
 
-\* publishGlobalDiagnostics returns -> executes: defer s.globalDiagPublishPending.Store(false)
-WorkerDeferClear ==
+\* End of pass step 1:
+\* - Buggy mode: defer Store(false) unconditionally
+\* - Fixed mode: CAS(RUNNING, IDLE) -> exit; else state was RERUN -> advance to reset_rerun
+\*   (split so TLC explicitly checks producers racing between CAS failure and Store(RUNNING)!)
+WorkerEndPass ==
     /\ workerPC = "sent_rpc"
-    /\ publishPending' = FALSE
     /\ workerSawChange' = FALSE
-    /\ workerPC' = "idle"
-    /\ UNCHANGED <<producedCount, globalDiagChanged, publishedCount, workerDiagSnap>>
+    /\ IF ~UseFix
+       THEN /\ publishState' = IDLE
+            /\ workerPC' = "idle"
+       ELSE IF publishState = RUNNING
+            THEN /\ publishState' = IDLE
+                 /\ workerPC' = "idle"
+            ELSE /\ workerPC' = "reset_rerun"
+                 /\ UNCHANGED publishState
+    /\ UNCHANGED <<producedCount, globalDiagChanged, publishedCount, workerDiagSnap, outOfOrderPublish>>
+
+\* End of pass step 2 (fixed mode only): Store(RUNNING) and loop back to scan
+WorkerResetRunning ==
+    /\ workerPC = "reset_rerun"
+    /\ publishState' = RUNNING
+    /\ workerPC' = "queued"
+    /\ UNCHANGED <<producedCount, globalDiagChanged, publishedCount, workerSawChange,
+                   workerDiagSnap, outOfOrderPublish>>
 
 Next ==
     \/ ProduceGlobalDiagAndEnqueue
     \/ WorkerTakeFlag
     \/ WorkerReadDiags
     \/ WorkerSendRPC
-    \/ WorkerDeferClear
+    \/ WorkerEndPass
+    \/ WorkerResetRunning
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(WorkerTakeFlag \/ WorkerReadDiags \/ WorkerSendRPC \/ WorkerEndPass \/ WorkerResetRunning)
 
 \* Safety at quiescence: when no background publish is pending/running,
 \* the client must have received all produced global diagnostics!
 NoLostGlobalDiagnostics ==
-    (workerPC = "idle" /\ ~publishPending) => (publishedCount = producedCount)
+    (workerPC = "idle" /\ publishState = IDLE) => (publishedCount = producedCount /\ ~globalDiagChanged)
+
+NoOutOfOrderPublish == ~outOfOrderPublish
+
+\* Liveness: every produced diagnostic is eventually published
+EventuallyAllPublished == <>(publishedCount = producedCount /\ publishState = IDLE)
 
 =============================================================================

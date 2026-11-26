@@ -69,6 +69,7 @@ run_case RefCountCache          RefCountCache          RefCountCache_ConcRef.cfg
 run_case RefCountCache          RefCountCache          RefCountCache_ConcRef_Overwrite.cfg    12
 run_case RefCountCache          RefCountCache          RefCountCache_DisableDel.cfg           12
 run_case SessionGlobalDiag      SessionGlobalDiag      SessionGlobalDiag.cfg                  12
+run_case SessionGlobalDiag      SessionGlobalDiag      SessionGlobalDiag_Fixed.cfg             0
 run_case LspWatcher             LspWatcher             LspWatcher_Resurrect.cfg               12
 run_case LspWatcher             LspWatcher             LspWatcher_StaleTerm.cfg               12
 run_case FSWatchDebounce        FSWatchDebounce        FSWatchDebounce.cfg                    12
