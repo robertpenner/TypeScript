@@ -77,6 +77,7 @@ run_case ContentMapperHost      ContentMapperHost      ContentMapperHost_Refresh
 run_case ContentMapperHost      ContentMapperHost      ContentMapperHost_Orphan.cfg           12
 run_case ExtendedConfigDeadlock ExtendedConfigDeadlock ExtendedConfigDeadlock.cfg             11
 run_case LspServerCancel        LspServerCancel        LspServerCancel.cfg                    12
+run_case LspServerCancel        LspServerCancel        LspServerCancel_Fixed.cfg               0
 run_case ApiSessionSnapshot     ApiSessionSnapshot     ApiSessionSnapshot_UAD.cfg             12
 run_case ApiSessionSnapshot     ApiSessionSnapshot     ApiSessionSnapshot_Leak.cfg            12
 

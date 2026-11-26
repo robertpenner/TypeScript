@@ -18,19 +18,24 @@
 
 | Issue | Slice | Status | Blocked by / reason | Integration commit | Verification |
 | --- | --- | --- | --- | --- | --- |
-| #4 | Fix lost global-diagnostics push notification (`project/session.go`) | integrated/verified | | `8f416ad` | TLC `SessionGlobalDiag_Fixed.cfg` 0 errors (72 distinct states, safety + liveness); `go test -race ./internal/project/...` 5/5 pkgs pass; `gofmt` + `go vet` clean |
-| #2 | Fix dropped `$/cancelRequest` for queued LSP requests (`lsp/server.go`) | in-progress | | | |
-| #3 | Fix `api.Session` snapshot use-after-deref & post-close leak (`api/session.go`) | ready | | | |
+| #4 | Fix lost global-diagnostics push notification (`project/session.go`) | integrated/verified | | `8f416ad` (PR #6) | TLC `SessionGlobalDiag_Fixed.cfg` 0 errors (72 distinct states, safety + liveness); `go test -race ./internal/project/...` 5/5 pkgs pass; `gofmt` + `go vet` clean |
+| #2 | Fix dropped `$/cancelRequest` for queued LSP requests (`lsp/server.go`) | integrated/verified | | `d9f6671` (PR #7) | TLC `LspServerCancel_Fixed.cfg` 0 errors (30 distinct states, deadlock-free); `go test -race ./internal/lsp/...` 3/3 pkgs pass; `gofmt` + `go vet` clean |
+| #3 | Fix `api.Session` snapshot use-after-deref & post-close leak (`api/session.go`) | in-progress | | | |
 | #5 | Redesign `dirty.SyncMap` entry lifecycle (`project/dirty/syncmap.go`) | ready | | | |
 
 ### Verification evidence
 
 - Starting baseline `3421f17`: `run-tlc.sh` 21/21 expected verdicts, `run-repros.sh` 19/19 reproducers confirmed.
-- Slice #4 (`fix/session-global-diag-push` `8f416ad`, base `e0fce98`):
+- Slice #4 (`fix/session-global-diag-push` `8f416ad`, base `e0fce98`, PR #6):
   - TLC `SessionGlobalDiag_Fixed.cfg`: 0 errors (98 generated, 72 distinct states) verifying `NoLostGlobalDiagnostics`, `NoOutOfOrderPublish`, `EventuallyAllPublished`.
   - TDD: `TestSessionEnqueuePublishGlobalDiagnosticsDuringInFlightPublish` failed before fix (`stillUnpublished is true`), passed after fix (`0.00s`).
   - `go -C ./tsc test -race -timeout=120s -count=1 ./internal/project/...`: 5/5 packages passed (`project`, `ata`, `background`, `dirty`, `logging`).
   - `gofmt -l` and `go vet ./internal/project/...`: clean.
+- Slice #2 (`fix/lsp-queued-cancel` `d9f6671`, base `e0fce98`, PR #7):
+  - TLC `LspServerCancel_Fixed.cfg`: 0 errors (45 generated, 30 distinct states, deadlock checking enabled) verifying `NoDroppedCancellation`, `NoLeakedPendingEntries`, `CanceledRequestRespondsCancelled`.
+  - TDD: `TestCancelRequestWhileQueuedInRequestQueue` failed before fix (`-32602 != -32800`), passed after fix (`0.00s`), alongside `TestCancelActiveRequestCancelsContext`.
+  - `go -C ./tsc test -race -timeout=120s -count=1 ./internal/lsp/...`: 3/3 packages passed (`lsp`, `lsproto`, `lspwatcher`).
+  - `gofmt -l` and `go vet ./internal/lsp/...`: clean.
 
 ### Recovery
 
