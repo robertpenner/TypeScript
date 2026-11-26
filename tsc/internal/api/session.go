@@ -423,15 +423,16 @@ func (s *Session) resolveSymbolReference(ref SymbolReference) (*ast.Symbol, *sna
 		if ref.File != nil || ref.Snapshot == 0 || ref.Project == 0 {
 			return nil, nil, 0, nil, fmt.Errorf("%w: invalid snapshot symbol reference", ErrClientError)
 		}
-		sd, err := s.getSnapshotData(ref.Snapshot)
+		sd, release, err := s.getSnapshotData(ref.Snapshot)
 		if err != nil {
 			return nil, nil, 0, nil, err
 		}
 		symbol, err := sd.resolveSymbolHandle(ref.Id)
 		if err != nil {
+			release()
 			return nil, nil, 0, nil, err
 		}
-		return symbol, sd, ref.Project, func() {}, nil
+		return symbol, sd, ref.Project, release, nil
 	default:
 		return nil, nil, 0, nil, fmt.Errorf("%w: invalid symbol reference kind %d", ErrClientError, ref.Kind)
 	}
@@ -580,6 +581,7 @@ type Session struct {
 	// the next one.
 	snapshots   map[SnapshotID]*snapshotData
 	snapshotsMu sync.RWMutex
+	closed      bool
 
 	// openProjects, openFiles, and createdPrograms are the canonical LSP-state resources
 	// owned by this API client. Guarded by languageServerUpdateMu.
@@ -699,27 +701,21 @@ func snapshotHandle(snapshot *project.Snapshot) SnapshotID {
 	return SnapshotID(snapshot.ID())
 }
 
-// getSnapshotData looks up snapshot data by handle.
-func (s *Session) getSnapshotData(handle SnapshotID) (*snapshotData, error) {
+// getSnapshotData looks up snapshot data by handle and retains the underlying
+// *project.Snapshot until the returned release function is called.
+func (s *Session) getSnapshotData(handle SnapshotID) (*snapshotData, func(), error) {
 	s.snapshotsMu.RLock()
 	sd, ok := s.snapshots[handle]
+	if ok {
+		s.snapshotHost.RetainSnapshot(sd.snapshot)
+	}
 	s.snapshotsMu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("%w: snapshot %d not found", ErrClientError, handle)
+		return nil, nil, fmt.Errorf("%w: snapshot %d not found", ErrClientError, handle)
 	}
-	return sd, nil
-}
-
-// retainSnapshotData pins snapshot data while an operation builds a derived snapshot.
-func (s *Session) retainSnapshotData(handle SnapshotID) (*snapshotData, error) {
-	s.snapshotsMu.Lock()
-	defer s.snapshotsMu.Unlock()
-	sd, ok := s.snapshots[handle]
-	if !ok {
-		return nil, fmt.Errorf("%w: snapshot %d not found", ErrClientError, handle)
-	}
-	sd.refCount++
-	return sd, nil
+	return sd, sync.OnceFunc(func() {
+		sd.snapshot.Deref()
+	}), nil
 }
 
 func (s *Session) releaseSnapshot(handle SnapshotID) error {
@@ -824,25 +820,29 @@ func (setup checkerSetup) resolveLocation(handle NodeHandle, file *DocumentIdent
 }
 
 // setupChecker resolves snapshot, program, and type checker for a project.
-// Callers must defer setup.done() to release the checker.
+// Callers must defer setup.done() to release the checker and snapshot pin.
 func (s *Session) setupChecker(ctx context.Context, snapshot SnapshotID, projectHandle project.Handle) (checkerSetup, error) {
-	sd, err := s.getSnapshotData(snapshot)
+	sd, releaseSnapshot, err := s.getSnapshotData(snapshot)
 	if err != nil {
 		return checkerSetup{}, err
 	}
 
 	program, err := sd.getProgram(projectHandle)
 	if err != nil {
+		releaseSnapshot()
 		return checkerSetup{}, err
 	}
 
 	c, done := program.GetTypeChecker(core.WithCheckerLifetime(ctx, core.CheckerLifetimeAPI))
 	return checkerSetup{
-		sd:        sd,
-		snapshot:  snapshot,
-		program:   program,
-		checker:   c,
-		done:      done,
+		sd:       sd,
+		snapshot: snapshot,
+		program:  program,
+		checker:  c,
+		done: func() {
+			done()
+			releaseSnapshot()
+		},
 		projectID: projectHandle,
 	}, nil
 }
@@ -1529,16 +1529,18 @@ func (s *Session) handleCreateSnapshot(ctx context.Context, params *CreateSnapsh
 	}
 
 	response := s.createSnapshotResponse(snapshot, nil, &params.SnapshotRequestChangesParams)
-	s.registerSnapshot(snapshot, openState, snapshotFileSystem)
+	if err := s.registerSnapshot(snapshot, openState, snapshotFileSystem); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
 func (s *Session) handleUpdateSnapshot(ctx context.Context, params *UpdateSnapshotParams) (*CreateSnapshotResponse, error) {
-	baseSD, err := s.retainSnapshotData(params.Snapshot)
+	baseSD, releaseBase, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = s.releaseSnapshot(params.Snapshot) }()
+	defer releaseBase()
 
 	changes := params.Changes
 	if changes == nil {
@@ -1585,7 +1587,9 @@ func (s *Session) handleUpdateSnapshot(ctx context.Context, params *UpdateSnapsh
 	}
 
 	response := s.createSnapshotResponse(snapshot, baseSD.snapshot, &changes.SnapshotRequestChangesParams)
-	s.registerSnapshot(snapshot, openState, snapshotFileSystem)
+	if err := s.registerSnapshot(snapshot, openState, snapshotFileSystem); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
@@ -1598,11 +1602,11 @@ func (s *Session) createRequestFileSystem(params *requestfilesystem.RequestFileS
 			return nil, fmt.Errorf("%w: only a layer or full filesystem can be applied on top of a snapshot filesystem", ErrClientError)
 		}
 		snapshotID := SnapshotID(params.Snapshot)
-		source, err := s.retainSnapshotData(snapshotID)
+		source, releaseSource, err := s.getSnapshotData(snapshotID)
 		if err != nil {
 			return nil, err
 		}
-		defer func() { _ = s.releaseSnapshot(snapshotID) }()
+		defer releaseSource()
 		base = requestfilesystem.Rebase(source.fileSystem, base, baseContents, fileChanges)
 		params = params.FileSystem
 		if params == nil {
@@ -1862,11 +1866,16 @@ func (s *Session) reconcileSnapshotOpens(apiRequest *project.APISnapshotRequest,
 	return state
 }
 
-func (s *Session) registerSnapshot(snapshot *project.Snapshot, openState snapshotOpenState, fileSystem vfs.FS) {
+func (s *Session) registerSnapshot(snapshot *project.Snapshot, openState snapshotOpenState, fileSystem vfs.FS) error {
 	// If the same snapshot ID is returned (no changes), we increment the ref count
 	// so each client-side Snapshot can be disposed independently.
 	handle := snapshotHandle(snapshot)
 	s.snapshotsMu.Lock()
+	if s.closed {
+		s.snapshotsMu.Unlock()
+		snapshot.Deref()
+		return fmt.Errorf("%w: session is closed", ErrClientError)
+	}
 	sd, exists := s.snapshots[handle]
 	if exists {
 		// Same snapshot already stored — release the caller's ref since
@@ -1888,6 +1897,7 @@ func (s *Session) registerSnapshot(snapshot *project.Snapshot, openState snapsho
 		s.snapshots[handle] = sd
 	}
 	s.snapshotsMu.Unlock()
+	return nil
 }
 
 func (s *Session) handleGetCurrentLanguageServerSnapshot(ctx context.Context, params *GetCurrentLanguageServerSnapshotParams) (*CreateSnapshotResponse, error) {
@@ -1896,16 +1906,23 @@ func (s *Session) handleGetCurrentLanguageServerSnapshot(ctx context.Context, pa
 	}
 	var baseSnapshot *project.Snapshot
 	if params.BaseSnapshot != 0 {
-		baseSD, err := s.retainSnapshotData(params.BaseSnapshot)
+		baseSD, releaseBase, err := s.getSnapshotData(params.BaseSnapshot)
 		if err != nil {
 			return nil, err
 		}
-		defer func() { _ = s.releaseSnapshot(params.BaseSnapshot) }()
+		defer releaseBase()
 		baseSnapshot = baseSD.snapshot
 	}
 
 	s.languageServerUpdateMu.Lock()
 	defer s.languageServerUpdateMu.Unlock()
+
+	s.snapshotsMu.RLock()
+	closed := s.closed
+	s.snapshotsMu.RUnlock()
+	if closed {
+		return nil, fmt.Errorf("%w: session is closed", ErrClientError)
+	}
 
 	changes := params.Changes
 	if changes == nil {
@@ -1923,7 +1940,9 @@ func (s *Session) handleGetCurrentLanguageServerSnapshot(ctx context.Context, pa
 
 	update.commit(s, snapshot)
 	response := s.createSnapshotResponse(snapshot, baseSnapshot, &changes.SnapshotRequestChangesParams)
-	s.registerSnapshot(snapshot, snapshotOpenState{openProjects: s.openProjects, openFiles: s.openFiles}, nil)
+	if err := s.registerSnapshot(snapshot, snapshotOpenState{openProjects: s.openProjects, openFiles: s.openFiles}, nil); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
@@ -1944,10 +1963,11 @@ func (s *Session) handleRelease(ctx context.Context, params *ReleaseParams) (any
 // or nil if no project currently contains the file.
 // @gen-proto-nullable
 func (s *Session) handleGetDefaultProjectForFile(ctx context.Context, params *GetDefaultProjectForFileParams) (*ProjectResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	uri := s.toURI(params.File)
 	proj := sd.snapshot.GetDefaultProject(uri)
@@ -2504,10 +2524,11 @@ func (s *Session) handleGetProgramStatistics(ctx context.Context, params *GetPro
 // @gen-proto-result: SourceFileResponse
 // @gen-proto-nullable
 func (s *Session) handleGetSourceFile(ctx context.Context, params *GetSourceFileParams) (any, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -2520,10 +2541,11 @@ func (s *Session) handleGetSourceFile(ctx context.Context, params *GetSourceFile
 // handleGetConfigFileNames returns tsconfig file names associated with the project's command line.
 // @gen-proto-nullable
 func (s *Session) handleGetConfigFileNames(ctx context.Context, params *GetProjectDiagnosticsParams) ([]tspath.RootedFilePath, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -2546,10 +2568,11 @@ func (s *Session) handleGetConfigFileNames(ctx context.Context, params *GetProje
 // @gen-proto-result: SourceFileResponse
 // @gen-proto-nullable
 func (s *Session) handleGetConfigSourceFile(ctx context.Context, params *GetSourceFileParams) (any, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -2609,10 +2632,11 @@ func (s *Session) encodeSourceFileResponse(sourceFile *ast.SourceFile) (any, err
 
 // handleGetSourceFileNames returns file names of all source files in a project.
 func (s *Session) handleGetSourceFileNames(ctx context.Context, params *GetSourceFileNamesParams) ([]tspath.RootedFilePath, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -2631,10 +2655,11 @@ func (s *Session) handleGetSourceFileNames(ctx context.Context, params *GetSourc
 // The client fetches this lazily per file and caches it.
 // @gen-proto-nullable
 func (s *Session) handleGetSourceFileMetadata(ctx context.Context, params *GetSourceFileParams) (*SourceFileMetadata, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -2686,10 +2711,11 @@ func newResolvedTypeReferenceDirectiveResponse(resolution *module.ResolvedTypeRe
 }
 
 func (s *Session) handleGetModeForUsageLocation(ctx context.Context, params *GetModeForUsageLocationParams) (core.ResolutionMode, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return core.ResolutionModeNone, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return core.ResolutionModeNone, err
@@ -2709,10 +2735,11 @@ func (s *Session) handleGetModeForUsageLocation(ctx context.Context, params *Get
 }
 
 func (s *Session) handleGetModeForResolutionAtIndex(ctx context.Context, params *GetModeForResolutionAtIndexParams) (core.ResolutionMode, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return core.ResolutionModeNone, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return core.ResolutionModeNone, err
@@ -2735,10 +2762,11 @@ func (s *Session) handleGetModeForResolutionAtIndex(ctx context.Context, params 
 
 // @gen-proto-nullable
 func (s *Session) handleGetResolvedModule(ctx context.Context, params *GetResolvedModuleParams) (*ResolvedModule, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return nil, err
@@ -2752,10 +2780,11 @@ func (s *Session) handleGetResolvedModule(ctx context.Context, params *GetResolv
 
 // @gen-proto-nullable
 func (s *Session) handleGetResolvedModuleFromModuleSpecifier(ctx context.Context, params *GetResolvedModuleFromModuleSpecifierParams) (*ResolvedModule, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return nil, err
@@ -2782,10 +2811,11 @@ func (s *Session) handleGetResolvedModuleFromModuleSpecifier(ctx context.Context
 
 // @gen-proto-nullable
 func (s *Session) handleGetResolvedTypeReferenceDirective(ctx context.Context, params *GetResolvedTypeReferenceDirectiveParams) (*ResolvedTypeReferenceDirective, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return nil, err
@@ -2799,10 +2829,11 @@ func (s *Session) handleGetResolvedTypeReferenceDirective(ctx context.Context, p
 
 // @gen-proto-nullable
 func (s *Session) handleGetResolvedTypeReferenceDirectiveFromReference(ctx context.Context, params *GetResolvedTypeReferenceDirectiveFromReferenceParams) (*ResolvedTypeReferenceDirective, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return nil, err
@@ -3373,10 +3404,11 @@ func (s *Session) handleGetTargetOfSignature(_ context.Context, params *GetSigna
 }
 
 func (s *Session) handleGetImportAdderEdits(ctx context.Context, params *GetImportAdderEditsParams) ([]*TextEdit, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	projectID := params.Project
 	proj, err := sd.getProject(projectID)
@@ -3557,10 +3589,11 @@ func (s *Session) resolveTypeArrayPropertyOfType(ctx context.Context, params *Ge
 
 // resolveSymbolPropertyOfType resolves a type property of type `Symbol` and returns a symbol response.
 func (s *Session) resolveSymbolPropertyOfType(params *GetTypePropertyParams, getter func(*checker.Type) *ast.Symbol) (*SymbolResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	t, err := sd.resolveTypeHandle(params.Project, params.Type)
 	if err != nil {
@@ -3670,10 +3703,11 @@ func (s *Session) resolveSymbolTablePropertyOfSymbol(ctx context.Context, params
 
 // resolveSymbolArrayPropertyOfSignature resolves a signature property of an array of symbols and returns an array of symbol responses.
 func (s *Session) resolveSymbolArrayPropertyOfSignature(params *GetSignaturePropertyParams, getter func(*checker.Signature) []*ast.Symbol) ([]*SymbolResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	sig, err := sd.resolveSignatureHandle(params.Project, params.Signature)
 	if err != nil {
@@ -3694,10 +3728,11 @@ func (s *Session) resolveSymbolArrayPropertyOfSignature(params *GetSignatureProp
 
 // resolveSymbolPropertyOfSignature resolves a signature property of type `Symbol` and returns a symbol response.
 func (s *Session) resolveSymbolPropertyOfSignature(params *GetSignaturePropertyParams, getter func(*checker.Signature) *ast.Symbol) (*SymbolResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	sig, err := sd.resolveSignatureHandle(params.Project, params.Signature)
 	if err != nil {
@@ -3736,10 +3771,11 @@ func (s *Session) resolveTypeArrayPropertyOfSignature(ctx context.Context, param
 }
 
 func (s *Session) resolveSignaturePropertyOfSignature(params *GetSignaturePropertyParams, getter func(*checker.Signature) *checker.Signature) (*SignatureResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	sig, err := sd.resolveSignatureHandle(params.Project, params.Signature)
 	if err != nil {
@@ -4531,15 +4567,17 @@ func newPrinter(params *PrintNodeParams, emitContext *printer.EmitContext) *prin
 }
 
 func (s *Session) handleEmit(ctx context.Context, params *EmitParams) (*EmitResponse, error) {
-	program, options, err := s.getEmitOptions(params)
+	program, options, releaseProgram, err := s.getEmitOptions(params)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseProgram()
 	var outputFiles map[tspath.RootedFilePath]string
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, releaseSD, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseSD()
 	if requestfilesystem.HasFullFileSystem(sd.fileSystem) {
 		outputFiles = make(map[tspath.RootedFilePath]string)
 		var outputMu sync.Mutex
@@ -4578,18 +4616,20 @@ func (s *Session) handleEmit(ctx context.Context, params *EmitParams) (*EmitResp
 }
 
 func (s *Session) handleEmitToString(ctx context.Context, params *EmitParams) (*EmitOutputResponse, error) {
-	program, options, err := s.getEmitOptions(params)
+	program, options, releaseProgram, err := s.getEmitOptions(params)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseProgram()
 	return emitToOutput(ctx, program, options)
 }
 
 func (s *Session) handleSelectedFilesEmit(ctx context.Context, params *SelectedFilesEmitParams, emitOnly compiler.EmitOnly) (*EmitOutputResponse, error) {
-	program, err := s.getEmitProgram(params.Snapshot, params.Project)
+	program, releaseProgram, err := s.getEmitProgram(params.Snapshot, params.Project)
 	if err != nil {
 		return nil, err
 	}
+	defer releaseProgram()
 	if params.Files == nil {
 		return nil, fmt.Errorf("%w: files is required", ErrClientError)
 	}
@@ -4637,26 +4677,32 @@ func emitToOutput(ctx context.Context, program *compiler.Program, options compil
 	}, nil
 }
 
-func (s *Session) getEmitOptions(params *EmitParams) (*compiler.Program, compiler.EmitOptions, error) {
-	program, err := s.getEmitProgram(params.Snapshot, params.Project)
+func (s *Session) getEmitOptions(params *EmitParams) (*compiler.Program, compiler.EmitOptions, func(), error) {
+	program, release, err := s.getEmitProgram(params.Snapshot, params.Project)
 	if err != nil {
-		return nil, compiler.EmitOptions{}, err
+		return nil, compiler.EmitOptions{}, nil, err
 	}
 	emitOnly, err := getEmitOnly(params.EmitOnly)
 	if err != nil {
-		return nil, compiler.EmitOptions{}, err
+		release()
+		return nil, compiler.EmitOptions{}, nil, err
 	}
 	return program, compiler.EmitOptions{
 		EmitOnly: emitOnly,
-	}, nil
+	}, release, nil
 }
 
-func (s *Session) getEmitProgram(snapshot SnapshotID, projectID project.Handle) (*compiler.Program, error) {
-	sd, err := s.getSnapshotData(snapshot)
+func (s *Session) getEmitProgram(snapshot SnapshotID, projectID project.Handle) (*compiler.Program, func(), error) {
+	sd, release, err := s.getSnapshotData(snapshot)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return sd.getProgram(projectID)
+	program, err := sd.getProgram(projectID)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return program, release, nil
 }
 
 func getEmitOnly(value *uint32) (compiler.EmitOnly, error) {
@@ -4692,10 +4738,11 @@ func nonNilDiagnostics(diags []*ast.Diagnostic) []*DiagnosticResponse {
 // handleFormatNodeForInsertion formats a synthesized node with the correct indentation
 // for insertion at a specific position in an existing file.
 func (s *Session) handleFormatNodeForInsertion(ctx context.Context, params *FormatNodeForInsertionParams) (string, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return "", err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -5788,16 +5835,18 @@ func (s *Session) createSnapshotOperationResponse(snapshot *project.Snapshot, re
 // regardless of their ref counts.
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
-		s.releaseLanguageServerRefs()
-		s.releaseSourceFileLeases()
-
 		s.snapshotsMu.Lock()
+		s.closed = true
 		snapshots := make([]*project.Snapshot, 0, len(s.snapshots))
 		for _, sd := range s.snapshots {
 			snapshots = append(snapshots, sd.snapshot)
 		}
 		clear(s.snapshots)
 		s.snapshotsMu.Unlock()
+
+		s.releaseLanguageServerRefs()
+		s.releaseSourceFileLeases()
+
 		for _, snapshot := range snapshots {
 			snapshot.Deref()
 		}
@@ -5890,10 +5939,11 @@ func (s *Session) toFileChangeSummary(changes *FileNotifications) project.FileCh
 }
 
 func (s *Session) getDiagnostics(ctx context.Context, params *GetDiagnosticsParams, getter func(*compiler.Program, context.Context, *ast.SourceFile) []*ast.Diagnostic) ([]*DiagnosticResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -5948,10 +5998,11 @@ func (s *Session) handleGetDeclarationDiagnostics(ctx context.Context, params *G
 // handleGetConfigFileParsingDiagnostics returns config file parsing diagnostics.
 // @gen-proto-nullable
 func (s *Session) handleGetConfigFileParsingDiagnostics(ctx context.Context, params *GetProjectDiagnosticsParams) ([]*DiagnosticResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -5965,10 +6016,11 @@ func (s *Session) handleGetConfigFileParsingDiagnostics(ctx context.Context, par
 // handleGetProgramDiagnostics returns program-wide diagnostics, including options diagnostics.
 // @gen-proto-nullable
 func (s *Session) handleGetProgramDiagnostics(ctx context.Context, params *GetProjectDiagnosticsParams) ([]*DiagnosticResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
@@ -5983,10 +6035,11 @@ func (s *Session) handleGetProgramDiagnostics(ctx context.Context, params *GetPr
 // @gen-proto-nullable
 func (s *Session) handleGetGlobalDiagnostics(ctx context.Context, params *GetProjectDiagnosticsParams) ([]*DiagnosticResponse, error) {
 	ctx = core.WithCheckerLifetime(ctx, core.CheckerLifetimeDiagnostics)
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	proj, err := sd.getProject(params.Project)
 	if err != nil {
@@ -6055,10 +6108,11 @@ func (s *Session) handleGetReferencesToSymbolInFile(ctx context.Context, params 
 
 // @gen-proto-nullable
 func (s *Session) handleGetSignatureUsages(ctx context.Context, params *GetSignatureUsagesParams) ([]SignatureUsageResponse, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return nil, err
@@ -6101,10 +6155,11 @@ func (s *Session) handleGetCompletionsAtPosition(ctx context.Context, params *Ge
 	if params.IncludeSymbol {
 		ctx = core.WithCheckerLifetime(ctx, core.CheckerLifetimeAPI)
 	}
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	run := func(snapshot *project.Snapshot, program *compiler.Program) (*ls.CompletionList, error) {
 		sourceFile := program.GetSourceFile(params.File.ToFileName(program.BaseDirectory()))
 		if sourceFile == nil {
@@ -6185,10 +6240,11 @@ func (s *Session) handleGetCompletionsAtPosition(ctx context.Context, params *Ge
 // handleGetReferencedSymbolsForNode returns node handles for all references found at a node.
 // @gen-proto-nullable
 func (s *Session) handleGetReferencedSymbolsForNode(ctx context.Context, params *GetReferencedSymbolsForNodeParams) ([]ReferencedSymbolEntry, error) {
-	sd, err := s.getSnapshotData(params.Snapshot)
+	sd, release, err := s.getSnapshotData(params.Snapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	program, err := sd.getProgram(params.Project)
 	if err != nil {
 		return nil, err

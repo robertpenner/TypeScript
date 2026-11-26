@@ -327,10 +327,11 @@ func (s *Session) handleResolveModuleName(ctx context.Context, params *ResolveMo
 	if err != nil {
 		return nil, err
 	}
-	resolver, err := s.moduleResolverForRequest(ctx, params.Resolver, params.Snapshot, params.InProgressSnapshot)
+	resolver, release, err := s.moduleResolverForRequest(ctx, params.Resolver, params.Snapshot, params.InProgressSnapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	containingDirectory := tspath.ToRootedDirectoryPath(params.ContainingDirectory.ToFileName(s.GetCurrentDirectory()).AsString(), s.GetCurrentDirectory())
 	result, trace, err := resolver.ResolveModuleNameFromDirectory(params.ModuleName, containingDirectory, mode)
 	if err != nil {
@@ -353,10 +354,11 @@ func (s *Session) handleResolveTypeReferenceDirective(ctx context.Context, param
 	if err != nil {
 		return nil, err
 	}
-	resolver, err := s.moduleResolverForRequest(ctx, params.Resolver, params.Snapshot, params.InProgressSnapshot)
+	resolver, release, err := s.moduleResolverForRequest(ctx, params.Resolver, params.Snapshot, params.InProgressSnapshot)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	result, trace := resolver.ResolveTypeReferenceDirective(params.TypeReferenceDirectiveName, params.ContainingFile.ToFileName(s.GetCurrentDirectory()), mode, nil)
 	return &ResolveTypeReferenceDirectiveResult{
 		ResolvedTypeReferenceDirective: newResolvedTypeReferenceDirectiveResponse(result),
@@ -375,31 +377,33 @@ func parseResolutionMode(mode *ResolutionMode) (core.ResolutionMode, error) {
 	return value, nil
 }
 
-func (s *Session) moduleResolverForRequest(ctx context.Context, id ModuleResolverID, snapshot SnapshotID, inProgressSnapshot uint64) (module.Resolver, error) {
+func (s *Session) moduleResolverForRequest(ctx context.Context, id ModuleResolverID, snapshot SnapshotID, inProgressSnapshot uint64) (module.Resolver, func(), error) {
 	s.moduleResolversMu.RLock()
 	data := s.moduleResolvers[id]
 	s.moduleResolversMu.RUnlock()
 	if data == nil {
-		return nil, fmt.Errorf("%w: module resolver %d not found", ErrClientError, id)
+		return nil, nil, fmt.Errorf("%w: module resolver %d not found", ErrClientError, id)
 	}
 
 	var resolver module.Resolver
+	release := func() {}
 	if snapshot != 0 && inProgressSnapshot != 0 {
-		return nil, fmt.Errorf("%w: snapshot and inProgressSnapshot are mutually exclusive", ErrClientError)
+		return nil, nil, fmt.Errorf("%w: snapshot and inProgressSnapshot are mutually exclusive", ErrClientError)
 	}
 	if inProgressSnapshot != 0 {
 		s.programResolutionContextsMu.RLock()
 		resolutionContext := s.programResolutionContexts[inProgressSnapshot]
 		s.programResolutionContextsMu.RUnlock()
 		if resolutionContext == nil {
-			return nil, fmt.Errorf("%w: in-progress snapshot %d not found", ErrClientError, inProgressSnapshot)
+			return nil, nil, fmt.Errorf("%w: in-progress snapshot %d not found", ErrClientError, inProgressSnapshot)
 		}
 		resolver = resolutionContext.resolverFor(data)
 	} else if snapshot != 0 {
-		sd, err := s.getSnapshotData(snapshot)
+		sd, releaseSnapshot, err := s.getSnapshotData(snapshot)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		release = releaseSnapshot
 		options := module.ResolverOptions{
 			Host:            sd.snapshot,
 			CompilerOptions: data.compilerOptions,
@@ -432,5 +436,5 @@ func (s *Session) moduleResolverForRequest(ctx context.Context, id ModuleResolve
 	if data.resolutions != nil {
 		resolver = module.NewStaticResolver(resolver, data.resolutions)
 	}
-	return resolver, nil
+	return resolver, release, nil
 }

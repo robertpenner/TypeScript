@@ -39,8 +39,9 @@ func TestProgramSourceFileIncludesSupplementalFile(t *testing.T) {
 		Project:  response.Projects[0].Handle,
 		File:     DocumentIdentifier{FileName: supplementalFileName},
 	}
-	sd, err := session.getSnapshotData(response.Snapshot)
+	sd, release, err := session.getSnapshotData(response.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	assert.Assert(t, sd.snapshot.GetFile(supplementalFileName) == nil)
 	sourceFile, err := session.handleGetSourceFile(context.Background(), params)
 	assert.NilError(t, err)

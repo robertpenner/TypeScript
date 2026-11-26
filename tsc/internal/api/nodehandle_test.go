@@ -27,8 +27,9 @@ func TestNodeHandlesIdentifyExactSourceFiles(t *testing.T) {
 		}},
 	})
 	assert.NilError(t, err)
-	sd, err := session.getSnapshotData(response.Snapshot)
+	sd, release, err := session.getSnapshotData(response.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	program, err := sd.getProgram(response.Projects[0].Handle)
 	assert.NilError(t, err)
 	file := program.GetSourceFiles()[0]
