@@ -278,3 +278,176 @@ func TestSyncMapLoadClean(t *testing.T) {
 	assert.Assert(t, ok)
 	assert.Equal(t, value, base["c"])
 }
+
+func TestSyncMapEntryLifecycleSafety(t *testing.T) {
+	t.Parallel()
+
+	t.Run("raced clean handle Delete deletes canonical dirty entry", func(t *testing.T) {
+		t.Parallel()
+		m := NewSyncMap(map[string]*testValue{"k": {data: "base"}})
+		e1, ok1 := m.Load("k")
+		e2, ok2 := m.Load("k")
+		assert.Assert(t, ok1 && ok2)
+
+		e1.Change(func(v *testValue) { v.data = "modified" })
+		e2.Delete()
+
+		_, exists := m.Load("k")
+		assert.Assert(t, !exists, "key must be deleted from SyncMap after e2.Delete()")
+		finalMap, changed := m.Finalize()
+		assert.Assert(t, changed)
+		_, exists = finalMap["k"]
+		assert.Assert(t, !exists, "key must not survive Finalize() after e2.Delete()")
+	})
+
+	t.Run("Map.Delete followed by clean handle Change does not panic and preserves OnDelete value", func(t *testing.T) {
+		t.Parallel()
+		baseVal := &testValue{data: "base"}
+		m := NewSyncMap(map[string]*testValue{"k": baseVal})
+		e1, ok := m.Load("k")
+		assert.Assert(t, ok)
+
+		m.Delete("k")
+
+		applied := false
+		e1.Change(func(v *testValue) {
+			applied = true
+			v.data = "mutated"
+		})
+		assert.Assert(t, !applied, "Change must not run apply on a deleted entry")
+
+		var deletedVal *testValue
+		finalMap, changed := m.FinalizeWith(FinalizationHooks[string, *testValue]{
+			OnDelete: func(_ string, v *testValue) { deletedVal = v },
+		})
+		assert.Assert(t, changed)
+		assert.Equal(t, deletedVal, baseVal)
+		_, exists := finalMap["k"]
+		assert.Assert(t, !exists)
+	})
+
+	t.Run("ChangeIf and DeleteIf re-check predicate against canonical dirty entry", func(t *testing.T) {
+		t.Parallel()
+		m := NewSyncMap(map[string]*testValue{"k": {data: "initial"}})
+		e1, _ := m.Load("k")
+		e2, _ := m.Load("k")
+		e3, _ := m.Load("k")
+
+		e1.Change(func(v *testValue) { v.data = "updated" })
+
+		applied := false
+		changed := e2.ChangeIf(
+			func(v *testValue) bool { return v.data == "initial" },
+			func(v *testValue) {
+				applied = true
+				v.data = "corrupted"
+			},
+		)
+		assert.Assert(t, !changed)
+		assert.Assert(t, !applied)
+		assert.Equal(t, e1.Value().data, "updated")
+
+		e3.DeleteIf(func(v *testValue) bool { return v.data == "initial" })
+		got, exists := m.Load("k")
+		assert.Assert(t, exists, "DeleteIf must not delete when canonical value fails predicate")
+		assert.Equal(t, got.Value().data, "updated")
+	})
+
+	t.Run("Change on handle after sibling entry Delete does not mutate deleted entry", func(t *testing.T) {
+		t.Parallel()
+		m := NewSyncMap(map[string]*testValue{"k": {data: "base"}})
+		e1, _ := m.Load("k")
+		e2, _ := m.Load("k")
+
+		e1.Delete()
+
+		applied := false
+		e2.Change(func(v *testValue) {
+			applied = true
+			v.data = "zombie"
+		})
+		assert.Assert(t, !applied)
+		_, exists := m.Load("k")
+		assert.Assert(t, !exists)
+	})
+
+	t.Run("Locked keeps canonical lock across Change then Delete and Change then Change", func(t *testing.T) {
+		t.Parallel()
+
+		// Change followed by Delete inside Locked on a raced clean handle must delete canonical entry.
+		m1 := NewSyncMap(map[string]*testValue{"k": {data: "base"}})
+		a1, _ := m1.Load("k")
+		a2, _ := m1.Load("k")
+		a1.Change(func(v *testValue) { v.data = "v1" })
+		a2.Locked(func(v Value[*testValue]) {
+			v.Change(func(val *testValue) { val.data = "v2" })
+			v.Delete()
+		})
+		_, exists := m1.Load("k")
+		assert.Assert(t, !exists)
+
+		// Change followed by Change inside Locked on a raced clean handle must stay race-free under -race.
+		m2 := NewSyncMap(map[string]*testValue{"k": {data: "base"}})
+		b1, _ := m2.Load("k")
+		b2, _ := m2.Load("k")
+		b1.Change(func(v *testValue) { v.data = "dirty" })
+
+		inSecond := make(chan struct{})
+		releaseSecond := make(chan struct{})
+		done1 := make(chan struct{})
+		go func() {
+			defer close(done1)
+			b2.Locked(func(v Value[*testValue]) {
+				v.Change(func(val *testValue) { val.data = "first" })
+				v.Change(func(val *testValue) {
+					close(inSecond)
+					<-releaseSecond
+					val.data = "second"
+				})
+			})
+		}()
+
+		<-inSecond
+		done2 := make(chan struct{})
+		go func() {
+			defer close(done2)
+			b1.Change(func(val *testValue) { val.data = "concurrent" })
+		}()
+		close(releaseSecond)
+		<-done1
+		<-done2
+		assert.Assert(t, b1.Value().data == "concurrent" || b1.Value().data == "second")
+	})
+
+	t.Run("uncontended ChangeIf, DeleteIf, and Locked.ChangeIf evaluate predicate once", func(t *testing.T) {
+		t.Parallel()
+		m := NewSyncMap(map[string]*testValue{
+			"a": {data: "init"},
+			"b": {data: "init"},
+			"c": {data: "init"},
+		})
+
+		ea, _ := m.Load("a")
+		aCalls := 0
+		assert.Assert(t, ea.ChangeIf(
+			func(v *testValue) bool { aCalls++; return v.data == "init" },
+			func(v *testValue) { v.data = "changed" },
+		))
+		assert.Equal(t, aCalls, 1)
+
+		eb, _ := m.Load("b")
+		bCalls := 0
+		eb.DeleteIf(func(v *testValue) bool { bCalls++; return v.data == "init" })
+		assert.Equal(t, bCalls, 1)
+
+		ec, _ := m.Load("c")
+		cCalls := 0
+		ec.Locked(func(v Value[*testValue]) {
+			assert.Assert(t, v.ChangeIf(
+				func(val *testValue) bool { cCalls++; return val.data == "init" },
+				func(val *testValue) { val.data = "changed" },
+			))
+		})
+		assert.Equal(t, cCalls, 1)
+	})
+}
