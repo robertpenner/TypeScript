@@ -69,7 +69,7 @@ Tier 2 covered the highest-risk concurrent protocols outside Tier 1 across 4 tar
   3. `LspWatchRegistry` (2 invariants: `InvTimedOutWatchCanBeUnwatched`, `InvNoDuplicateUnwatch`): `Server.WatchFiles` only adds `id` to `s.watchers` after `sendClientRequest` succeeds, so a timed-out request installed by a slow client can never be unwatched (`"no file watcher exists with ID ..."`); `Server.UnwatchFiles` checks `s.watchers.Has(id)` before the unlocked RPC and deletes afterward, letting concurrent calls send duplicate `client/unregisterCapability` RPCs.
 - **Verified-safe negative checks:** `pendingServerRequests` lock-protected channel close/delete; `handleInitialized` calling `sendClientRequest` while `readLoop` routes responses independently; `projectLoadingProgress.stopDelay` setting `delay = nil`.
 
-#### Target 4: `ipc` Sync/Async Transport and `ls/autoimport` Registry (Complete)
+#### Target 4: `ipc` Sync/Async Transport and `ls/autoimport` Registry (Complete, commit `616a404`)
 
 - **Audited files:** `tsc/internal/ipc/conn_sync.go`, `conn_async.go`, `transport.go`, `tsc/internal/ls/autoimport/registry.go`, `specifiers.go`, `view.go`, `extract.go`, `tsc/internal/project/session.go` (`GetLanguageServiceWithAutoImports`, `warmAutoImportCache`), `tsc/internal/binder/binder.go`.
 - **Verified defects (2 TLA+ specs, 4 TLC violations, 4 confirmed Go `-race` reproducers, all novel upstream):**
@@ -91,7 +91,21 @@ Selected from a repository-wide synchronization census of `tsc/internal` (exclud
 
 ## Handoff From Discovery to Remediation
 
-At the end of Phase 2 (or after any high-severity Target 2/3/4 milestone):
+Phase 2 discovery findings are triaged into clustered remediation tickets on `robertpenner/TypeScript` under parent epic `robertpenner/TypeScript#10` (all 9 children labeled `bug`, `ready-for-agent`, covering 23/23 TLC violations and 21/21 Go `-race` reproducers):
+
+- **Wave 1 (unrecovered panics, SIGSEGV, silent wire corruption):**
+  - `robertpenner/TypeScript#16`: `lsp.Server` lifecycle panics (`LspServerLifecycle`, Findings #15–#17)
+  - `robertpenner/TypeScript#12`: `tsc -b -w` unresolved-project double-close panic/SIGSEGV and stale downstream leak (`BuildOrchestratorWatch`, Findings #4–#5)
+  - `robertpenner/TypeScript#13`: `OwnerCache.Release` blind delete `AddOwner` panic (`OwnerCacheRelease`, Finding #6)
+  - `robertpenner/TypeScript#18`: `ipc.SyncConn` notification response swap and cancel response orphan (`IpcSyncConn`, Findings #20–#21)
+- **Wave 2 (`-race` data races, cache poisoning, watch & diagnostics correctness):**
+  - `robertpenner/TypeScript#15`: `project.Session` out-of-order program diagnostics and unsynchronized `DidChangeCompilerOptionsForInferredProjects` (`SessionProgramDiag` + `SessionInferredOptions`, Findings #10–#12)
+  - `robertpenner/TypeScript#19`: `ls/autoimport` cancelled `buildProjectBucket` clean-commit poisoning and cross-bucket `Registry.entrypoints` clobber (`AutoImportRegistry`, Findings #22–#23)
+  - `robertpenner/TypeScript#17`: `lsp.Server` progress locale data race/stuck spinner and watch registry timeout/duplicate unwatch (`LspProgressLocale` + `LspWatchRegistry`, Findings #13–#14, #18–#19)
+  - `robertpenner/TypeScript#14`: `project.Session` watch protocol leaks, rollback stranding, and live-watch theft (`SessionWatchProtocol`, Findings #7–#9)
+  - `robertpenner/TypeScript#11`: `FSWatchLifecycle` 3-lock TOCTOU (`FSWatchLifecycle`, Findings #1–#3)
+
+Remediation workflow for each ticket:
 
 1. **Triage findings:** classify each verified defect as Tier A (direct production crash, deadlock, leak, or silent stale state) or Tier B (core primitive or exported-API contract violation), matching the structure of `ANALYSIS.md`.
 2. **Track remediation issues:** file or update issues on `robertpenner/TypeScript` linking the TLA+ spec, TLC counterexample trace, and Go `-race` reproducer for each cluster of related defects.
