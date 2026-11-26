@@ -1,11 +1,11 @@
 # Idiomatic Go Concurrency Architecture for TypeScript 7 Tooling (`tsc/internal`)
 
 Branch: `tla-tier2-investigation` (upstream base `e0fce98`)
-Companion reports: [`FINDINGS.md`](./FINDINGS.md) (Tier 1), [`ANALYSIS.md`](./ANALYSIS.md) (Tier 1 root-cause analysis), [`FINDINGS-TIER2.md`](./FINDINGS-TIER2.md) (Tier 2 findings), [`ROADMAP.md`](./ROADMAP.md) (verification roadmap)
+Companion reports: [`FINDINGS.md`](./FINDINGS.md) (Tier 1), [`ANALYSIS.md`](./ANALYSIS.md) (Tier 1 root-cause analysis), [`FINDINGS-TIER2.md`](./FINDINGS-TIER2.md) (Tier 2 findings), [`ANALYSIS-TIER2.md`](./ANALYSIS-TIER2.md) (Tier 2 root-cause analysis), [`ROADMAP.md`](./ROADMAP.md) (verification roadmap)
 
 ## Overview
 
-Formal verification with TLA+ and deterministic Go `-race` reproducers has confirmed **36 concurrency and state-machine defects** across `tsc/internal` (17 in Tier 1 across 9 components, plus 19 in Tier 2 Targets 1 to 3 across `fswatch`, `execute/build`, `project`, and `lsp`), with Target 4 specs for `ls/autoimport` and `ipc` underway.
+Formal verification with TLA+ and deterministic Go `-race` reproducers has confirmed **40 concurrency and state-machine defects** across `tsc/internal` (17 in Tier 1 across 9 components, plus 23 in Tier 2 Targets 1 to 4 across `fswatch`, `execute/build`, `project`, `lsp`, `ipc`, and `ls/autoimport`).
 
 These failures share a structural theme. TypeScript 7 runs a Go compiler and language server whose concurrency needs split cleanly into two different modes, yet `tsc/internal` applies fine-grained shared-memory locking (`collections.SyncMap`, per-entry `sync.Mutex`, standalone `atomic.Bool` flags, and unbounded `go func()` calls) across stateful I/O orchestration where Go favors explicit state machines, single-owner actor loops, and level-triggered reconcilers.
 
@@ -44,6 +44,8 @@ In idiomatic Go, control-plane state machines are owned by **one goroutine** (an
 | `DirtySyncMap` 5 defects (Tier 1) | Two-level `SyncMap` + per-entry `sync.Mutex` + `proxyFor` forwarding + `lockedEntry` | **Fixed-shard map** (`[N]shard`, each one `sync.Mutex` + plain `map[K]*entry`) or single mutex where contention is low |
 | `ExtendedConfigDeadlock` (Tier 1; upstream `#64833`, `#65300`) | Holding `entry[A].mu` across recursive `GetExtendedConfig(B)` | **Speculative lock-free parse** outside the entry lock using goroutine-local `resolutionStack`, then publish immutable result (or single-lock cycle-aware wait graph) |
 | `BuildOrchestratorWatch` 2 defects (Tier 2) | Reusing `*BuildTask` across watch cycles (stale closed `done`/`built` channels and unreset `downStream` slice) | **Immutable per-cycle execution state**: separate persistent config/build-info caches from fresh per-cycle task structs with fresh channels and edges |
+| `IpcSyncConn` 2 defects (Tier 2) | Reusing `method` as `msg.ID`, unlocking `c.mu` during notifications, and writing onto the pipe before checking `ctx.Err()` | **Unique correlation IDs + demux reader** (like `ipc.AsyncConn`), or strict single-flight turn ownership separating nested peer callbacks from external callers plus pre-write `ctx.Err()` check and drain/close on abort |
+| `AutoImportRegistry` 2 defects (Tier 2) | Parallel `buildProjectBucket` ignoring `ctx.Err()` at join (committing empty bucket as clean) and global `ResolvedPath`-only `entrypoints` map across buckets | **Transactional cancellation** (propagate `ctx.Err()` at join and refuse snapshot adoption on cancellation) + **partition-scoped or owner-tracked metadata** for shared symlink entrypoints |
 
 ---
 
@@ -226,9 +228,9 @@ The lost-notification defect (`SessionGlobalDiag`) only appeared one layer above
 
 ## 6. Engineering Guardrails for Go Concurrency in `tsc/internal`
 
-Two properties of Go explain why these 36 verified bugs survived normal unit tests and CI `-race` runs:
+Two properties of Go explain why these 40 verified bugs survived normal unit tests and CI `-race` runs:
 
-1. **Go's `-race` detector checks memory synchronization only.** Thirty-two of the 36 verified defects are data-race-free logical races (deadlocks, nil-pointer panics, close-of-closed-channel panics, lost wakeups, TOCTOU across two mutexes, orphaned child processes, stale overwrites, leaked watches, and stuck progress spinners). `-race` caught only 4 (`dirty.SyncMap.Locked`, `BuildOrchestratorWatch` on `task.result`, `SessionInferredOptions`, and `LspProgressLocale` on `r.server.locale`).
+1. **Go's `-race` detector checks memory synchronization only.** Thirty-six of the 40 verified defects (90%) are data-race-free logical races (deadlocks, nil-pointer panics, close-of-closed-channel panics, silent cross-call payload swaps, permanent clean-cache poisoning, lost wakeups, TOCTOU across two mutexes, orphaned child processes, stale overwrites, leaked watches, and stuck progress spinners). `-race` caught only 4 (`dirty.SyncMap.Locked`, `BuildOrchestratorWatch` on `task.result`, `SessionInferredOptions`, and `LspProgressLocale` on `r.server.locale`).
 2. **Go does not tie locks to fields in the type system.** Porting imperative multi-step object mutations from single-threaded TypeScript 5 by adding per-field mutexes and `go func()` calls expands the cross-operation state space faster than hand-written tests can cover.
 
 Practical rules for reviewing and refactoring concurrent code in `tsc/internal`:
@@ -238,4 +240,5 @@ Practical rules for reviewing and refactoring concurrent code in `tsc/internal`:
 - **No unbounded `go func()` for ordered side effects:** Route external updates (watchers, diagnostics, registrations) through level-triggered reconcilers with 1-buffered channels.
 - **Inspect every lock release:** Any code that unlocks across I/O, RPC, or recursion needs either a retained scoped handle, an identity/generation check on re-entry, or speculative lock-free computation.
 - **Use `CompareAndDelete` and explicit state enums in concurrent caches:** Avoid encoding four lifecycle phases in boolean/counter combinations or deleting map keys without checking entry identity.
+- **Keep wire correlation unique, cancellation transactional, and keys canonical:** Never multiplex requests on non-unique method names; check `ctx.Err()` before committing parallel builds or adopting derived snapshots; never key open/close tracking tables by localized display strings or let one partition delete metadata still owned by sibling partitions.
 - **Pair `testing/synctest` with TLA+ for multi-goroutine protocols:** Follow `AGENTS.md`'s guidance to write deterministic in-memory concurrency tests with Go's `testing/synctest` (virtual clocks and `synctest.Wait()`), and use small TLA+ models whenever a component crosses two locks, spawns background goroutines, or manages async resource lifecycles.
