@@ -1917,6 +1917,13 @@ func (s *Session) handleGetCurrentLanguageServerSnapshot(ctx context.Context, pa
 	s.languageServerUpdateMu.Lock()
 	defer s.languageServerUpdateMu.Unlock()
 
+	s.snapshotsMu.RLock()
+	closed := s.closed
+	s.snapshotsMu.RUnlock()
+	if closed {
+		return nil, fmt.Errorf("%w: session is closed", ErrClientError)
+	}
+
 	changes := params.Changes
 	if changes == nil {
 		changes = &LanguageServerSnapshotChanges{}
