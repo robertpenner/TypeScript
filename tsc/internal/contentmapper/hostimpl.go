@@ -423,9 +423,13 @@ func (h *host) Project(spec ProjectSpec) Project {
 	if lease := h.projectLeases[key]; lease != nil {
 		return lease.retainLocked()
 	}
-	lease := &projectLease{host: h, key: key, mappers: slices.Clone(spec.Mappers), entries: make(map[*Mapper]string, len(spec.Mappers))}
+	lease := &projectLease{host: h, key: key, mappers: make([]*Mapper, 0, len(spec.Mappers)), entries: make(map[*Mapper]string, len(spec.Mappers))}
 	lease.refs = 1
 	for _, mapper := range spec.Mappers {
+		if _, exists := lease.entries[mapper]; exists {
+			continue
+		}
+		lease.mappers = append(lease.mappers, mapper)
 		entryKey := fmt.Sprintf("%s:%d", mapper.Identity(), h.nextProjectID)
 		h.nextProjectID++
 		entry := &projectEntry{mapper: mapper, spec: spec, projectHandle: entryKey}
@@ -583,6 +587,9 @@ func (h *host) Transform(mapper *Mapper, request Request) (Result, error) {
 		Mappers:         []*Mapper{mapper},
 		CompilerOptions: &core.CompilerOptions{},
 	})
+	if project == nil {
+		return Result{}, errors.New("content mapper host is closed")
+	}
 	defer project.Close()
 	return project.Transform(mapper, request)
 }
