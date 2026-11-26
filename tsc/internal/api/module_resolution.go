@@ -396,10 +396,11 @@ func (s *Session) moduleResolverForRequest(ctx context.Context, id ModuleResolve
 		}
 		resolver = resolutionContext.resolverFor(data)
 	} else if snapshot != 0 {
-		sd, err := s.getSnapshotData(snapshot)
+		sd, release, err := s.getSnapshotData(snapshot)
 		if err != nil {
 			return nil, err
 		}
+		defer release()
 		options := module.ResolverOptions{
 			Host:            sd.snapshot,
 			CompilerOptions: data.compilerOptions,

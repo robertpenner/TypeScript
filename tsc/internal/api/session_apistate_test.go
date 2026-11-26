@@ -208,8 +208,9 @@ func TestGetCurrentLanguageServerSnapshotFlushesPendingLSPChanges(t *testing.T) 
 	assert.NilError(t, err)
 	assert.Equal(t, response.Snapshot, snapshotHandle(projectSession.Snapshot()))
 
-	snapshot, err := session.getSnapshotData(response.Snapshot)
+	snapshot, release, err := session.getSnapshotData(response.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	assert.Equal(t, snapshot.snapshot.GetFile(fileName).Content(), `export const value: string = "ok";`)
 }
 
@@ -308,8 +309,9 @@ func TestOpenFilePreservesWindowsDriveLetterCase(t *testing.T) {
 	assert.NilError(t, err)
 
 	project := response.Projects[0]
-	snapshot, err := session.getSnapshotData(response.Snapshot)
+	snapshot, release, err := session.getSnapshotData(response.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	program, err := snapshot.getProgram(project.Handle)
 	assert.NilError(t, err)
 	assert.Equal(t, program.GetSourceFile(fileName).FileName(), tspath.RootedFilePathFromNormalized(fileName))

@@ -79,8 +79,9 @@ func TestCreateSnapshotCreatesPrograms(t *testing.T) {
 	assert.Equal(t, response.Projects[0].ParsedCommandLine.Options.Strict, core.TSTrue)
 	assert.DeepEqual(t, response.Projects[1].ParsedCommandLine.FileNames, []tspath.RootedFilePath{fileB})
 
-	snapshot, err := session.getSnapshotData(response.Snapshot)
+	snapshot, release, err := session.getSnapshotData(response.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	assert.Equal(t, len(snapshot.snapshot.CreatedPrograms()), 2)
 	for _, projectResponse := range response.Projects {
 		assert.Assert(t, snapshot.snapshot.ProjectCollection.GetProject(projectResponse.Id) != nil)
@@ -106,8 +107,9 @@ func TestCreateSnapshotPreservesWindowsRootDriveLetterCase(t *testing.T) {
 	})
 	assert.NilError(t, err)
 
-	snapshot, err := session.getSnapshotData(response.Snapshot)
+	snapshot, release, err := session.getSnapshotData(response.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	program, err := snapshot.getProgram(response.Projects[0].Handle)
 	assert.NilError(t, err)
 	assert.Equal(t, program.GetSourceFile(fileName).FileName(), tspath.RootedFilePathFromNormalized(fileName))
@@ -356,8 +358,9 @@ func TestCreateSnapshotResolvesPathsRelativeToParsedConfigDirectory(t *testing.T
 
 	response, err := session.handleCreateSnapshot(context.Background(), &createParams)
 	assert.NilError(t, err)
-	snapshot, err := session.getSnapshotData(response.Snapshot)
+	snapshot, release, err := session.getSnapshotData(response.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	program, err := snapshot.getProgram(response.Projects[0].Handle)
 	assert.NilError(t, err)
 	assert.Assert(t, program.GetSourceFile(libFile) != nil, "expected 'lib' to resolve via paths relative to /project")

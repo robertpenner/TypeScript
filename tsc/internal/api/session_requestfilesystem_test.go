@@ -522,8 +522,9 @@ func TestCreateProgramRetainsFullFileSystem(t *testing.T) {
 	})
 	assert.NilError(t, err)
 
-	snapshot, err := session.getSnapshotData(created.Snapshot)
+	snapshot, release, err := session.getSnapshotData(created.Snapshot)
 	assert.NilError(t, err)
+	defer release()
 	program, err := snapshot.getProgram(snapshot.snapshot.ProjectCollection.GetProject((*created.Operation.CreatedPrograms)[0].AsID()).Handle())
 	assert.NilError(t, err)
 	assert.Assert(t, program.GetSourceFile("/new.ts") != nil)
