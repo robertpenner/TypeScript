@@ -323,7 +323,7 @@ type watcher struct {
 	impl       watcherImpl
 	factory    func() watcherImpl // nil if not available on this platform
 	dirWatches map[string]*dirWatch
-	debounce   *debounce // lazily created in getOrCreateDirWatch
+	debounce   *debounce // lazily created in getOrCreateDirWatchLocked
 	sequence   func() uint64
 }
 
@@ -432,9 +432,7 @@ func (w *watcher) findConsolidationDirLocked(dir string, physicalDir string) str
 	return ""
 }
 
-func (w *watcher) getOrCreateDirWatch(dir string, physicalDir string, recursive bool, comparer pathComparer) (*dirWatch, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+func (w *watcher) getOrCreateDirWatchLocked(dir string, physicalDir string, recursive bool, comparer pathComparer) (*dirWatch, error) {
 	if w.dirWatches == nil {
 		w.dirWatches = make(map[string]*dirWatch)
 	}
@@ -474,9 +472,7 @@ func (w *watcher) getOrCreateDirWatch(dir string, physicalDir string, recursive 
 	return dw, nil
 }
 
-func (w *watcher) removeDirWatch(dw *dirWatch) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+func (w *watcher) removeDirWatchLocked(dw *dirWatch) {
 	key := w.keyForDirWatch(dw.dir, dw.recursive)
 	if existing, ok := w.dirWatches[key]; ok && existing == dw {
 		delete(w.dirWatches, key)
@@ -504,43 +500,30 @@ func (w *watcher) WatchDirectories(requests []WatchDirectoryRequest) ([]Watch, e
 		return nil, nil
 	}
 
-	type preparedWatch struct {
-		dw        *dirWatch
-		id        uint64
-		recursive bool
-		dir       string
+	type validatedRequest struct {
+		dir         string
+		physicalDir string
+		fn          WatchCallback
+		sopts       watchOptions
+		comparer    pathComparer
 	}
-	prepared := make([]preparedWatch, 0, len(requests))
-	uniqueDirWatches := make([]*dirWatch, 0, len(requests))
-	seenDirWatches := make(map[*dirWatch]struct{}, len(requests))
-	rollback := func() {
-		for _, p := range slices.Backward(prepared) {
-
-			p.dw.unwatch(p.id)
-			p.dw.unref(w)
-		}
-	}
-
+	validated := make([]validatedRequest, 0, len(requests))
 	for _, request := range requests {
 		dir := request.Dir
 		fn := request.Callback
 		if fn == nil {
-			rollback()
 			return nil, errNilCallback
 		}
 		if nativepath.IsNetworkPath(dir) {
-			rollback()
 			return nil, errNetworkPath
 		}
 		dir = filepath.Clean(dir)
 		if !filepath.IsAbs(dir) {
-			rollback()
 			return nil, errNotAbsolute
 		}
 		dir = canonicalizePath(dir)
 		if w.canShareRecursiveDirWatches() {
 			if err := validateWatchDirectory(dir); err != nil {
-				rollback()
 				return nil, err
 			}
 		}
@@ -553,29 +536,63 @@ func (w *watcher) WatchDirectories(requests []WatchDirectoryRequest) ([]Watch, e
 
 		comparer, err := w.pathComparer(dir)
 		if err != nil {
-			rollback()
 			return nil, err
 		}
-		dw, err := w.getOrCreateDirWatch(dir, physicalDir, sopts.recursive, comparer)
+		validated = append(validated, validatedRequest{
+			dir:         dir,
+			physicalDir: physicalDir,
+			fn:          fn,
+			sopts:       sopts,
+			comparer:    comparer,
+		})
+	}
+
+	impl, err := w.getImpl()
+	if err != nil {
+		return nil, err
+	}
+
+	type preparedWatch struct {
+		dw        *dirWatch
+		id        uint64
+		recursive bool
+		dir       string
+	}
+	prepared := make([]preparedWatch, 0, len(validated))
+	uniqueDirWatches := make([]*dirWatch, 0, len(validated))
+	seenDirWatches := make(map[*dirWatch]struct{}, len(validated))
+
+	// Hold w.mu across registry lookup/creation, callback registration, and
+	// backend subscription so a concurrent watch.Close cannot tear down a
+	// dirWatch's debounce handle, registry entry, or OS subscription while a
+	// new handle is attaching to it. Lock order: watch.mu -> w.mu -> dw.mu / b.mu.
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	rollbackLocked := func() {
+		for _, p := range slices.Backward(prepared) {
+			if p.dw.unwatch(p.id) {
+				w.removeDirWatchLocked(p.dw)
+			}
+		}
+	}
+
+	for _, vr := range validated {
+		dw, err := w.getOrCreateDirWatchLocked(vr.dir, vr.physicalDir, vr.sopts.recursive, vr.comparer)
 		if err != nil {
-			rollback()
+			rollbackLocked()
 			return nil, err
 		}
-		id, _ := dw.addCallback(dir, physicalDir, sopts.recursive, fn, sopts.ignore, sopts.file)
-		prepared = append(prepared, preparedWatch{dw: dw, id: id, recursive: sopts.recursive, dir: dir})
+		id, _ := dw.addCallback(vr.dir, vr.physicalDir, vr.sopts.recursive, vr.fn, vr.sopts.ignore, vr.sopts.file)
+		prepared = append(prepared, preparedWatch{dw: dw, id: id, recursive: vr.sopts.recursive, dir: vr.dir})
 		if _, ok := seenDirWatches[dw]; !ok {
 			seenDirWatches[dw] = struct{}{}
 			uniqueDirWatches = append(uniqueDirWatches, dw)
 		}
 	}
 
-	impl, err := w.getImpl()
-	if err != nil {
-		rollback()
-		return nil, err
-	}
 	if err := impl.watchAddMany(uniqueDirWatches); err != nil {
-		rollback()
+		rollbackLocked()
 		return nil, err
 	}
 
@@ -636,10 +653,12 @@ func (s *watch) Close() error {
 		return nil
 	}
 	s.cancelled = true
-	last := s.dw.unwatch(s.id)
-	if last {
+
+	s.w.mu.Lock()
+	defer s.w.mu.Unlock()
+	if s.dw.unwatch(s.id) {
 		s.impl.watchRemove(s.dw)
-		s.dw.unref(s.w)
+		s.w.removeDirWatchLocked(s.dw)
 	}
 	return nil
 }
@@ -1166,13 +1185,4 @@ func (dw *dirWatch) unwatch(id uint64) bool {
 		}
 	}
 	return false
-}
-
-func (dw *dirWatch) unref(w *watcher) {
-	dw.mu.Lock()
-	empty := len(dw.callbacks) == 0
-	dw.mu.Unlock()
-	if empty {
-		w.removeDirWatch(dw)
-	}
 }
