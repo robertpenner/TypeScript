@@ -8,11 +8,61 @@ import (
 )
 
 type lockedEntry[K comparable, V Cloneable[V]] struct {
-	e *SyncMapEntry[K, V]
+	e               *SyncMapEntry[K, V]
+	canonical       *SyncMapEntry[K, V]
+	unlockCanonical func()
+}
+
+func (le *lockedEntry[K, V]) close() {
+	if le.unlockCanonical != nil {
+		le.unlockCanonical()
+		le.unlockCanonical = nil
+	}
+}
+
+func (le *lockedEntry[K, V]) current() *SyncMapEntry[K, V] {
+	if le.canonical != nil {
+		return le.canonical
+	}
+	if le.e.proxyFor != nil {
+		le.e.proxyFor.mu.Lock()
+		le.canonical = le.e.proxyFor
+		le.unlockCanonical = le.e.proxyFor.mu.Unlock
+		return le.canonical
+	}
+	if le.e.dirty || le.e.delete {
+		le.canonical = le.e
+		return le.e
+	}
+	if existing, ok := le.e.m.dirty.Load(le.e.key); ok {
+		if existing == le.e {
+			le.canonical = le.e
+			return le.e
+		}
+		existing.mu.Lock()
+		le.e.proxyFor = existing
+		le.e.value = existing.value
+		le.e.dirty = existing.dirty
+		le.e.delete = existing.delete
+		le.canonical = existing
+		le.unlockCanonical = existing.mu.Unlock
+		return existing
+	}
+	return le.e
+}
+
+func (le *lockedEntry[K, V]) ensureCanonical() *SyncMapEntry[K, V] {
+	if le.canonical != nil {
+		return le.canonical
+	}
+	c, unlock := le.e.lockCanonicalLocked()
+	le.canonical = c
+	le.unlockCanonical = unlock
+	return c
 }
 
 func (e *lockedEntry[K, V]) Value() V {
-	return e.e.valueLocked()
+	return e.current().valueLocked()
 }
 
 func (e *lockedEntry[K, V]) Original() V {
@@ -20,23 +70,29 @@ func (e *lockedEntry[K, V]) Original() V {
 }
 
 func (e *lockedEntry[K, V]) Dirty() bool {
-	return e.e.dirty
+	return e.current().dirty
 }
 
 func (e *lockedEntry[K, V]) Change(apply func(V)) {
-	e.e.changeLocked(apply)
+	c := e.ensureCanonical()
+	changeCanonicalLocked(c, e.e, apply)
 }
 
 func (e *lockedEntry[K, V]) ChangeIf(cond func(V) bool, apply func(V)) bool {
-	if cond(e.e.valueLocked()) {
-		e.e.changeLocked(apply)
-		return true
+	cur := e.current()
+	if cur.delete || !cond(cur.value) {
+		return false
 	}
-	return false
+	c := e.ensureCanonical()
+	return changeIfCanonicalLocked(c, e.e, cond, apply)
 }
 
 func (e *lockedEntry[K, V]) Delete() {
-	e.e.deleteLocked()
+	c := e.ensureCanonical()
+	c.delete = true
+	if c != e.e {
+		e.e.delete = true
+	}
 }
 
 func (e *lockedEntry[K, V]) Locked(fn func(Value[V])) {
@@ -52,6 +108,72 @@ type SyncMapEntry[K comparable, V Cloneable[V]] struct {
 	// may try to mutate the same underlying value, all mutations are routed
 	// through the one that actually exists in the dirty map.
 	proxyFor *SyncMapEntry[K, V]
+}
+
+// lockCanonicalLocked ensures the key has a canonical entry in e.m.dirty,
+// binds e.proxyFor if another entry won the race, and returns the canonical
+// entry with its mutex held (along with an unlock function when canonical != e).
+// Caller must hold e.mu.
+func (e *SyncMapEntry[K, V]) lockCanonicalLocked() (*SyncMapEntry[K, V], func()) {
+	if e.proxyFor != nil {
+		e.proxyFor.mu.Lock()
+		return e.proxyFor, e.proxyFor.mu.Unlock
+	}
+	if e.dirty || e.delete {
+		return e, func() {}
+	}
+	entry, loaded := e.m.dirty.LoadOrStore(e.key, e)
+	if loaded && entry != e {
+		entry.mu.Lock()
+		e.proxyFor = entry
+		e.value = entry.value
+		e.dirty = entry.dirty
+		e.delete = entry.delete
+		return entry, entry.mu.Unlock
+	}
+	return e, func() {}
+}
+
+func changeCanonicalLocked[K comparable, V Cloneable[V]](c, handle *SyncMapEntry[K, V], apply func(V)) {
+	if c.delete {
+		if handle != c {
+			handle.delete = true
+		}
+		return
+	}
+	if !c.dirty {
+		c.value = c.value.Clone()
+		c.dirty = true
+	}
+	apply(c.value)
+	if handle != c {
+		handle.value = c.value
+		handle.dirty = c.dirty
+		handle.delete = c.delete
+	}
+}
+
+func changeIfCanonicalLocked[K comparable, V Cloneable[V]](c, handle *SyncMapEntry[K, V], cond func(V) bool, apply func(V)) bool {
+	if c.delete {
+		if handle != c {
+			handle.delete = true
+		}
+		return false
+	}
+	if !cond(c.value) {
+		return false
+	}
+	if !c.dirty {
+		c.value = c.value.Clone()
+		c.dirty = true
+	}
+	apply(c.value)
+	if handle != c {
+		handle.value = c.value
+		handle.dirty = c.dirty
+		handle.delete = c.delete
+	}
+	return true
 }
 
 func (e *SyncMapEntry[K, V]) Value() V {
@@ -87,105 +209,80 @@ func (e *SyncMapEntry[K, V]) Locked(fn func(Value[V])) {
 		e.proxyFor.Locked(fn)
 		return
 	}
-	fn(&lockedEntry[K, V]{e: e})
+	le := lockedEntry[K, V]{e: e}
+	defer le.close()
+	fn(&le)
 }
 
 func (e *SyncMapEntry[K, V]) Change(apply func(V)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.proxyFor != nil {
-		e.proxyFor.Change(apply)
-		return
-	}
-	e.changeLocked(apply)
-}
-
-func (e *SyncMapEntry[K, V]) changeLocked(apply func(V)) {
-	if e.dirty {
-		apply(e.value)
-		return
-	}
-
-	entry, loaded := e.m.dirty.LoadOrStore(e.key, e)
-	if loaded {
-		entry.mu.Lock()
-		defer entry.mu.Unlock()
-	}
-	if !entry.dirty {
-		entry.value = entry.value.Clone()
-		entry.dirty = true
-	}
-	if loaded {
-		e.proxyFor = entry
-		e.value = entry.value
-		e.dirty = true
-		e.delete = entry.delete
-	}
-	apply(entry.value)
+	c, unlock := e.lockCanonicalLocked()
+	defer unlock()
+	changeCanonicalLocked(c, e, apply)
 }
 
 func (e *SyncMapEntry[K, V]) ChangeIf(cond func(V) bool, apply func(V)) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.proxyFor != nil {
-		return e.proxyFor.ChangeIf(cond, apply)
+	if e.proxyFor == nil && !e.dirty && !e.delete {
+		if existing, ok := e.m.dirty.Load(e.key); ok && existing != e {
+			existing.mu.Lock()
+			defer existing.mu.Unlock()
+			e.proxyFor = existing
+			e.value = existing.value
+			e.dirty = existing.dirty
+			e.delete = existing.delete
+			return changeIfCanonicalLocked(existing, e, cond, apply)
+		}
+		if !cond(e.value) {
+			return false
+		}
 	}
-
-	if cond(e.value) {
-		e.changeLocked(apply)
-		return true
-	}
-	return false
+	c, unlock := e.lockCanonicalLocked()
+	defer unlock()
+	return changeIfCanonicalLocked(c, e, cond, apply)
 }
 
 func (e *SyncMapEntry[K, V]) Delete() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.proxyFor != nil {
-		e.proxyFor.Delete()
-		return
-	}
-
-	if e.dirty {
+	c, unlock := e.lockCanonicalLocked()
+	defer unlock()
+	c.delete = true
+	if c != e {
 		e.delete = true
-		return
 	}
-	entry, loaded := e.m.dirty.LoadOrStore(e.key, e)
-	if loaded {
-		entry.mu.Lock()
-		defer entry.mu.Unlock()
-		e.delete = true
-	} else {
-		entry.delete = true
-	}
-}
-
-func (e *SyncMapEntry[K, V]) deleteLocked() {
-	if e.dirty {
-		e.delete = true
-		return
-	}
-	entry, loaded := e.m.dirty.LoadOrStore(e.key, e)
-	if loaded {
-		entry.mu.Lock()
-		defer entry.mu.Unlock()
-		e.proxyFor = entry
-		e.value = entry.value
-		e.delete = true
-		e.dirty = entry.dirty
-	}
-	entry.delete = true
 }
 
 func (e *SyncMapEntry[K, V]) DeleteIf(cond func(V) bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.proxyFor != nil {
-		e.proxyFor.DeleteIf(cond)
-		return
+	if e.proxyFor == nil && !e.dirty && !e.delete {
+		if existing, ok := e.m.dirty.Load(e.key); ok && existing != e {
+			existing.mu.Lock()
+			defer existing.mu.Unlock()
+			e.proxyFor = existing
+			e.value = existing.value
+			e.dirty = existing.dirty
+			e.delete = existing.delete
+			if !existing.delete && cond(existing.value) {
+				existing.delete = true
+				e.delete = true
+			}
+			return
+		}
+		if !cond(e.value) {
+			return
+		}
 	}
-	if cond(e.value) {
-		e.deleteLocked()
+	c, unlock := e.lockCanonicalLocked()
+	defer unlock()
+	if !c.delete && cond(c.value) {
+		c.delete = true
+		if c != e {
+			e.delete = true
+		}
 	}
 }
 
@@ -271,10 +368,12 @@ func (m *SyncMap[K, V]) LoadOrStore(key K, value V) (*SyncMapEntry[K, V], bool) 
 }
 
 func (m *SyncMap[K, V]) Delete(key K) {
+	baseVal := m.base[key]
 	entry, loaded := m.dirty.LoadOrStore(key, &SyncMapEntry[K, V]{
 		m:        m,
 		key:      key,
-		original: m.base[key],
+		original: baseVal,
+		value:    baseVal,
 		delete:   true,
 	})
 	if loaded {
