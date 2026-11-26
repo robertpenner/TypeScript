@@ -71,5 +71,9 @@ run_case LspServerLifecycle     LspServerLifecycle     LspServerLifecyclePostShu
 run_case LspServerLifecycle     LspServerLifecycle     LspServerLifecycleDupInit.cfg               12
 run_case LspWatchRegistry       LspWatchRegistry       LspWatchRegistryTimeout.cfg                 12
 run_case LspWatchRegistry       LspWatchRegistry       LspWatchRegistryDupUnwatch.cfg              12
+run_case IpcSyncConn            IpcSyncConn            IpcSyncConn_NotificationSwap.cfg            12
+run_case IpcSyncConn            IpcSyncConn            IpcSyncConn_CancelOrphan.cfg                12
+run_case AutoImportRegistry     AutoImportRegistry     AutoImportRegistry_CancelCleanCommit.cfg    12
+run_case AutoImportRegistry     AutoImportRegistry     AutoImportRegistry_EntrypointClobber.cfg    12
 
 echo "=== All expected Tier 2 TLC verdicts matched ==="

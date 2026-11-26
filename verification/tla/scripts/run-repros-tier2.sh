@@ -11,6 +11,8 @@ TMP_FILES=(
   "$TSC_DIR/internal/project/tla_repro_ownercache_tmp_test.go"
   "$TSC_DIR/internal/project/tla_repro_session_tmp_test.go"
   "$TSC_DIR/internal/lsp/tla_repro_tier2_tmp_test.go"
+  "$TSC_DIR/internal/ipc/tla_repro_tier2_tmp_test.go"
+  "$TSC_DIR/internal/ls/autoimport/tla_repro_tier2_tmp_test.go"
 )
 
 cleanup() {
@@ -23,6 +25,8 @@ cp "$REPRO_DIR/build_orchestrator_watch_repro_test.go" "$TSC_DIR/internal/execut
 cp "$REPRO_DIR/ownercache_release_repro_test.go"       "$TSC_DIR/internal/project/tla_repro_ownercache_tmp_test.go"
 cp "$REPRO_DIR/session_project_repro_test.go"          "$TSC_DIR/internal/project/tla_repro_session_tmp_test.go"
 cp "$REPRO_DIR/lsp_server_tier2_repro_test.go"         "$TSC_DIR/internal/lsp/tla_repro_tier2_tmp_test.go"
+cp "$REPRO_DIR/ipc_sync_tier2_repro_test.go"           "$TSC_DIR/internal/ipc/tla_repro_tier2_tmp_test.go"
+cp "$REPRO_DIR/autoimport_tier2_repro_test.go"         "$TSC_DIR/internal/ls/autoimport/tla_repro_tier2_tmp_test.go"
 
 # Format: "<pkg>|<test-regex>|<mode>"
 #   mode=fail  -> expects --- FAIL: TestRepro...
@@ -45,6 +49,10 @@ CASES=(
   "./internal/lsp|^TestReproLspDuplicateInitializedCloseClosedChannelPanic$|crash"
   "./internal/lsp|^TestReproLspWatchFilesTimeoutStrandsClientRegistration$|fail"
   "./internal/lsp|^TestReproLspWatchFilesConcurrentUnwatchDuplicateRPC$|fail"
+  "./internal/ipc|^TestReproIpcSyncConnNotificationConcurrentCallResponseSwap$|fail"
+  "./internal/ipc|^TestReproIpcSyncConnCancelledCallOrphansResponseAndPoisonsConn$|fail"
+  "./internal/ls/autoimport|^TestReproAutoImportBuildProjectBucketCancelCommitsTruncatedCleanBucket$|fail"
+  "./internal/ls/autoimport|^TestReproAutoImportSharedEntrypointsCrossBucketClobber$|fail"
 )
 
 total_reproduced=0

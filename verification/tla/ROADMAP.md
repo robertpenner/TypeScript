@@ -34,9 +34,9 @@ Covered 10 components across 8 packages (`tsc/internal` pinned at `e0fce98`):
 
 ---
 
-### Phase 2: Tier 2 Investigation (Active on `tla-tier2-investigation`)
+### Phase 2: Tier 2 Investigation (Complete on `tla-tier2-investigation`)
 
-Tier 2 targets the highest-risk concurrent protocols outside Tier 1: file-watch orchestration, `tsc -b -w`, project session lifecycle, LSP server orchestration, async IPC, and auto-import indexing.
+Tier 2 covered the highest-risk concurrent protocols outside Tier 1 across 4 targets: file-watch orchestration, `tsc -b -w`, project session lifecycle, LSP server orchestration, sync/async IPC, and auto-import indexing. Across all 4 targets, Tier 2 produced **11 TLA+ specifications**, **23 verified TLC invariant violations (all exit 12)**, and **21 confirmed `go test -race` reproducers**, all novel upstream.
 
 #### Target 1: `execute/build`, `execute/watchmanager`, and `fswatch` (Complete, commit `0fb5e65`)
 
@@ -58,7 +58,7 @@ Tier 2 targets the highest-risk concurrent protocols outside Tier 1: file-watch 
   4. `SessionInferredOptions` (2 invariants: `InvNoLostOverlay`, `InvNoNilSnapshotClone`): `DidChangeCompilerOptionsForInferredProjects` skips `s.snapshotUpdateMu`, causing a live Go `-race` data race on `s.compilerOptionsForInferredProjects`, stale-overlay overwrite against concurrent `DidOpenFile`, and a nil-pointer dereference panic in `oldSnapshot.Clone` when racing with or called after `Session.Close()`.
 - **Verified-safe negative checks:** `publishProgramDiagnostics` vs `checkerPool.Discard()`; `updateContentMapperRegistrations` (`contentMapperRegistrationMu` + monotonic `snapshot.ID()` guard); `background.Queue` `Enqueue`/`Close` `WaitGroup` protocol.
 
-#### Target 3: `lsp` Server Lifecycle, Progress Actor, and Watch Registry (Complete)
+#### Target 3: `lsp` Server Lifecycle, Progress Actor, and Watch Registry (Complete, commit `ed2bf53`)
 
 `tsc/internal/lsp` has 12 sync primitives across `server.go`, `dynamic_queue.go`, and `progress.go` (excluding `$/cancelRequest` queue residency covered in Tier 1 `LspServerCancel`).
 
@@ -69,11 +69,13 @@ Tier 2 targets the highest-risk concurrent protocols outside Tier 1: file-watch 
   3. `LspWatchRegistry` (2 invariants: `InvTimedOutWatchCanBeUnwatched`, `InvNoDuplicateUnwatch`): `Server.WatchFiles` only adds `id` to `s.watchers` after `sendClientRequest` succeeds, so a timed-out request installed by a slow client can never be unwatched (`"no file watcher exists with ID ..."`); `Server.UnwatchFiles` checks `s.watchers.Has(id)` before the unlocked RPC and deletes afterward, letting concurrent calls send duplicate `client/unregisterCapability` RPCs.
 - **Verified-safe negative checks:** `pendingServerRequests` lock-protected channel close/delete; `handleInitialized` calling `sendClientRequest` while `readLoop` routes responses independently; `projectLoadingProgress.stopDelay` setting `delay = nil`.
 
-#### Target 4: `ipc` Async Transport and `ls/autoimport` Registry (In Progress)
+#### Target 4: `ipc` Sync/Async Transport and `ls/autoimport` Registry (Complete)
 
-- **Scope:**
-  - `tsc/internal/ipc/conn_async.go`, `conn_sync.go`, `transport.go`: concurrent request multiplexing, response correlation, cancellation and close races, write serialization, and shutdown draining.
-  - `tsc/internal/ls/autoimport/registry.go`, `index.go`, `extract.go`: concurrent `Clone` / cache warming (`warmAutoImportCache`), dirty bucket transitions, and shared cache stats or node_modules bucket mutation.
+- **Audited files:** `tsc/internal/ipc/conn_sync.go`, `conn_async.go`, `transport.go`, `tsc/internal/ls/autoimport/registry.go`, `specifiers.go`, `view.go`, `extract.go`, `tsc/internal/project/session.go` (`GetLanguageServiceWithAutoImports`, `warmAutoImportCache`), `tsc/internal/binder/binder.go`.
+- **Verified defects (2 TLA+ specs, 4 TLC violations, 4 confirmed Go `-race` reproducers, all novel upstream):**
+  1. `IpcSyncConn` (2 invariants: `NoCrossCallResponseSwap`, `NoOrphanedResponsePoison`): `SyncConn.Call` uses `method` as the request ID and drops `c.reading` / unlocks `c.mu` on incoming notifications, allowing a concurrent caller for the same method to send a request and silently swap responses with `err == nil` (persists after `microsoft/TypeScript#64639`); `Call` also writes the request onto the pipe before checking `ctx.Err()`, so a cancelled call leaves an orphaned response that kills `SyncConn.Run()` with `ipc: unexpected response message in sync connection`.
+  2. `AutoImportRegistry` (2 invariants: `CleanSessionBucketIsComplete`, `LiveBucketExportsHaveEntrypoints`): `buildProjectBucket` omits `result.err = ctx.Err()` after `wg.Wait()` and `Session.GetLanguageServiceWithAutoImports` adopts the snapshot without checking `ctx.Err()`, permanently committing a 0-export clean project bucket into `Session.snapshot`; `Registry.entrypoints` is keyed solely by `ResolvedPath` across all `node_modules` buckets, so dropping a symlinked workspace package from one bucket deletes the shared entrypoint for another untouched bucket, bypassing `"exports"` condition checks and leaking an illegal relative path into `dist/`.
+- **Verified-safe negative checks:** `ipc.AsyncConn` monotonic ID + `pendingMu`/`writeMu` teardown; `binder.BindSourceFile` `file.BindOnce` guard; `warmAutoImportCache` `ctx.Err()` check before adoption.
 
 ---
 
