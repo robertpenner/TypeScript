@@ -93,7 +93,7 @@ func (c *RefCountCache[K, V, AcquireArgs]) AcquireOrError(identity K, produce fu
 	if err != nil {
 		// Undo the speculative entry so failures are not cached.
 		entry.refCount = 0
-		c.entries.Delete(identity)
+		c.entries.CompareAndDelete(identity, entry)
 		return value, err
 	}
 	entry.value = value
@@ -131,7 +131,7 @@ func (c *RefCountCache[K, V, AcquireArgs]) Deref(identity K) {
 	defer entry.mu.Unlock()
 	entry.refCount--
 	if entry.refCount <= 0 && !c.Options.DisableDeletion {
-		c.entries.Delete(identity)
+		c.entries.CompareAndDelete(identity, entry)
 	}
 }
 

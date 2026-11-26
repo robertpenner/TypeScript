@@ -82,9 +82,12 @@ func (c *OwnerCache[K, V, LoadArgs]) Release(identity K, owner uint64) {
 	}
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	if _, existed := entry.owners[owner]; !existed {
+		return
+	}
 	delete(entry.owners, owner)
 	if len(entry.owners) == 0 {
-		c.entries.Delete(identity)
+		c.entries.CompareAndDelete(identity, entry)
 	}
 }
 

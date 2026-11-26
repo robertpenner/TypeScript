@@ -36,6 +36,10 @@ func (s *SyncMap[K, V]) Delete(key K) {
 	s.m.Delete(key)
 }
 
+func (s *SyncMap[K, V]) CompareAndDelete(key K, old V) (deleted bool) {
+	return s.m.CompareAndDelete(key, old)
+}
+
 func (s *SyncMap[K, V]) Clear() {
 	s.m.Clear()
 }
