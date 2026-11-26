@@ -2,7 +2,7 @@
 
 Branch: `tla-tier2-investigation` (base `3421f17`)
 Worktree: `/workspaces/robertpenner/TypeScript-tla-tier2`
-Companion reports: [`FINDINGS.md`](./FINDINGS.md) (Tier 1), [`ANALYSIS.md`](./ANALYSIS.md) (Tier 1 architecture analysis), [`FINDINGS-TIER2.md`](./FINDINGS-TIER2.md) (Tier 2 findings), [`ANALYSIS-TIER2.md`](./ANALYSIS-TIER2.md) (Tier 2 root-cause analysis), [`GO-ARCHITECTURE.md`](./GO-ARCHITECTURE.md) (target Go concurrency architecture)
+Companion reports: [`FINDINGS.md`](./FINDINGS.md) (Tier 1), [`ANALYSIS.md`](./ANALYSIS.md) (Tier 1 architecture analysis), [`FINDINGS-TIER2.md`](./FINDINGS-TIER2.md) (Tier 2 findings), [`ANALYSIS-TIER2.md`](./ANALYSIS-TIER2.md) (Tier 2 root-cause analysis), [`FINDINGS-TIER3.md`](./FINDINGS-TIER3.md) (Tier 3 findings), [`ANALYSIS-TIER3.md`](./ANALYSIS-TIER3.md) (Tier 3 and cross-tier synthesis), [`GO-ARCHITECTURE.md`](./GO-ARCHITECTURE.md) (target Go concurrency architecture)
 
 ## Overview
 
@@ -79,26 +79,46 @@ Tier 2 covered the highest-risk concurrent protocols outside Tier 1 across 4 tar
 
 ---
 
-### Phase 3: Tier 3 Backlog (Compiler Internals, API Surface, and Core Primitives)
+### Phase 3: Tier 3 Investigation (Complete on `tla-tier2-investigation`)
 
-Selected from a repository-wide synchronization census of `tsc/internal` (excluding generated files and tests):
+Phase 3 audited all remaining unmodeled packages in `tsc/internal` with concurrency primitives (`api`, `contentmapper`, `compiler`, `core`, `execute/incremental`, `ls`, `checker`, `project/logging`, `ast`, `tsoptions`). Across all remaining packages, Tier 3 produced **3 TLA+ specifications**, **7 verified TLC invariant violations (all exit 12)**, **4 exhaustive fixed-model TLC proofs (exit 0)**, and **7 confirmed `go test -race` reproducers**, all novel upstream:
 
-1. **`tsc/internal/api/session.go` (beyond snapshot lookup):** 18 sync sites covering API request dispatch, handle tables, API-supplied filesystem layers, and `Close` teardown outside the Tier 1 `ApiSessionSnapshot` scope.
-2. **`tsc/internal/compiler/` (`program.go`, `fileloader.go`, `checkerpool.go`):** 23 sync sites across 5 files covering parallel file loading, lazy program caches, and compiler checker-pool coordination.
-3. **`tsc/internal/core/` (`workgroup.go`, `bfs.go`):** 10 sync sites covering `WorkGroup`, `ThrottleGroup` (used by ATA and compiler), panic/error propagation, and parallel BFS termination.
-4. **`tsc/internal/execute/incremental/` and `tsc/internal/tsoptions/parsedcommandline.go`:** 17 combined sync sites covering build-info caching and lazy parsed-command-line initialization.
-5. **`tsc/internal/contentmapper/hostimpl.go` (remaining lifecycle paths):** server restart, mapper crash recovery, and `Close` outside `projectLease.Transform`.
+1. **`ApiSessionLifecycle` (`tsc/internal/api/session.go`, 3 violations + 1 fixed proof, 3/3 reproducers):**
+   - `NoPostCloseLspRefLeak`: `Session.Close()` releases LSP references under `languageServerUpdateMu` without setting a closed guard, allowing a concurrent `handleGetCurrentLanguageServerSnapshot` to leak open projects, files, or synthetic programs into the shared LSP `project.Session` permanently.
+   - `NoPostCloseLeaseLeak`: `registerSourceFileLease` inserts into `s.sourceFileLeases` under `sourceFileLeasesMu` without checking whether `releaseSourceFileLeases()` already ran, pinning `*ast.SourceFile` refcounts in `parseCache`.
+   - `NoPostCloseBatchPageLeak`: `paginateBatchResponses` stores continuation pages into `s.batchResponsePages` with no closed check against `s.batchResponsePages.Clear()` in `Close()`.
+   - Additional code-audit finding: `Session.Close()` never stops an active `s.cpuProfiler` on mid-profile disconnect.
+2. **`ContentMapperTransformClose` (`tsc/internal/contentmapper/hostimpl.go`, 2 violations + 1 fixed proof, 2/2 reproducers):**
+   - `NoNilProjectDeref`: `host.Close()` sets `h.projects = nil`, causing `host.Project` to return `nil`, and `host.Transform` panics dereferencing `project` (still present after `microsoft/TypeScript#65492`).
+   - `NoLeakedConnRef`: `host.Project` does not deduplicate repeated `*Mapper` pointers in `spec.Mappers` (unlike `host.Acquire`), overwriting `lease.entries[mapper]` and permanently leaking `h.projects` entries and `connEntry.refs`.
+3. **`CompilerFilesParserDepth` (`tsc/internal/compiler/filesparser.go`, 2 violations + 2 fixed proofs, 2/2 reproducers):**
+   - `LoadedFileStartsSubtasks`: `filesParser.start()` mutates `data.lowestDepth` and `data.startedSubTasks` before checking `if task.elideOnDepth && currentDepth > w.maxDepth { return }`, silently dropping transitive imports and references when an elided `node_modules` JS arrival reaches a file before a non-elided arrival at the same depth (missed in `microsoft/TypeScript#64632`).
+   - `LowestNonElidedDepthReached`: an elided arrival at depth `d` (`> maxDepth`) lowers `data.lowestDepth` from a deeper non-elided depth without restarting subtasks, blocking a later non-elided arrival at depth `d` from restarting them.
+- **Verified-safe / clean-audit packages (7 packages):** `core` (`workgroup.go`, `bfs.go`), `execute/incremental`, `ls` (outside `autoimport`), `checker`, `project/logging`, `ast`, and `tsoptions`.
+
+### Cross-Tier Rollup (Phases 1 through 3 Complete)
+
+| Phase | Specs | Verified Defects | Go `-race` Reproducers | Trigger `-race` | Race-Free Protocol Bugs | Epic & Tickets |
+|---|---|---|---|---|---|---|
+| Tier 1 | 10 (9 buggy + `CheckerPool`) | 17 | 19 | 1 | 16 | `robertpenner/TypeScript#1` (`#2`–`#5`) |
+| Tier 2 | 11 | 23 | 21 | 3 | 20 | `robertpenner/TypeScript#10` (`#11`–`#19`) |
+| Tier 3 | 3 | 7 | 7 | 0 | 7 | `robertpenner/TypeScript#20` (`#21`–`#23`) |
+| **Total** | **24** | **47** | **47** | **4 (8.5%)** | **43 (91.5%)** | **3 epics, 16 tickets** |
 
 ## Handoff From Discovery to Remediation
 
-Phase 2 discovery findings are triaged into clustered remediation tickets on `robertpenner/TypeScript` under parent epic `robertpenner/TypeScript#10` (all 9 children labeled `bug`, `ready-for-agent`, covering 23/23 TLC violations and 21/21 Go `-race` reproducers):
+Phase 2 and Phase 3 discovery findings are triaged into clustered remediation tickets on `robertpenner/TypeScript` under parent epics `robertpenner/TypeScript#10` (Tier 2: 9 tickets, 23 defects) and `robertpenner/TypeScript#20` (Tier 3: 3 tickets, 7 defects):
 
-- **Wave 1 (unrecovered panics, SIGSEGV, silent wire corruption):**
+- **Tier 3 (all 3 tickets have exit-0 fixed TLC proofs ready):**
+  - `robertpenner/TypeScript#23`: `compiler.filesParser` `elideOnDepth` guard ordering (`CompilerFilesParserDepth`, Findings #6–#7)
+  - `robertpenner/TypeScript#21`: `contentmapper.host` `Transform` nil-project dereference after `Close` and duplicate `Mapper` leak (`ContentMapperTransformClose`, Findings #4–#5)
+  - `robertpenner/TypeScript#22`: `api.Session` post-close leaks across LSP refs, source file leases, batch pages, and unstopped `cpuProfiler` (`ApiSessionLifecycle`, Findings #1–#3)
+- **Tier 2 Wave 1 (unrecovered panics, SIGSEGV, silent wire corruption):**
   - `robertpenner/TypeScript#16`: `lsp.Server` lifecycle panics (`LspServerLifecycle`, Findings #15–#17)
   - `robertpenner/TypeScript#12`: `tsc -b -w` unresolved-project double-close panic/SIGSEGV and stale downstream leak (`BuildOrchestratorWatch`, Findings #4–#5)
   - `robertpenner/TypeScript#13`: `OwnerCache.Release` blind delete `AddOwner` panic (`OwnerCacheRelease`, Finding #6)
   - `robertpenner/TypeScript#18`: `ipc.SyncConn` notification response swap and cancel response orphan (`IpcSyncConn`, Findings #20–#21)
-- **Wave 2 (`-race` data races, cache poisoning, watch & diagnostics correctness):**
+- **Tier 2 Wave 2 (`-race` data races, cache poisoning, watch & diagnostics correctness):**
   - `robertpenner/TypeScript#15`: `project.Session` out-of-order program diagnostics and unsynchronized `DidChangeCompilerOptionsForInferredProjects` (`SessionProgramDiag` + `SessionInferredOptions`, Findings #10–#12)
   - `robertpenner/TypeScript#19`: `ls/autoimport` cancelled `buildProjectBucket` clean-commit poisoning and cross-bucket `Registry.entrypoints` clobber (`AutoImportRegistry`, Findings #22–#23)
   - `robertpenner/TypeScript#17`: `lsp.Server` progress locale data race/stuck spinner and watch registry timeout/duplicate unwatch (`LspProgressLocale` + `LspWatchRegistry`, Findings #13–#14, #18–#19)
