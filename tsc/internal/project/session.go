@@ -127,6 +127,12 @@ type Session struct {
 	registeredContentMapperSnapshotID uint64
 	contentMapperRegistrationMu       sync.Mutex
 
+	// publishedProgramDiagnostics tracks the newest snapshot ID published per config file.
+	// Background diagnostic publishes may execute concurrently or out of order, so
+	// programDiagnosticsMu serializes publishes and the watermark drops stale snapshots.
+	publishedProgramDiagnostics map[tspath.RootedFilePath]uint64
+	programDiagnosticsMu        sync.Mutex
+
 	// read-only after initialization
 	initialUserPreferences lsutil.UserPreferences
 	// current preferences
@@ -236,10 +242,11 @@ func NewSession(init *SessionInit) *Session {
 			0,
 			lsproto.GetClientCapabilities(init.BackgroundCtx).Workspace.DidChangeWatchedFiles.RelativePatternSupport,
 		),
-		initialUserPreferences:   lsutil.NewDefaultUserPreferences(),
-		workspaceUserPreferences: lsutil.NewDefaultUserPreferences(),
-		pendingATAChanges:        make(map[ID]*ATAStateChange),
-		watches:                  newWatchRegistry(),
+		initialUserPreferences:      lsutil.NewDefaultUserPreferences(),
+		workspaceUserPreferences:    lsutil.NewDefaultUserPreferences(),
+		pendingATAChanges:           make(map[ID]*ATAStateChange),
+		watches:                     newWatchRegistry(),
+		publishedProgramDiagnostics: make(map[tspath.RootedFilePath]uint64),
 	}
 
 	if init.Options.TypingsLocation != "" && init.NpmExecutor != nil {
@@ -498,9 +505,16 @@ func (s *Session) DidChangeWatchedFiles(ctx context.Context, changes []*lsproto.
 }
 
 func (s *Session) DidChangeCompilerOptionsForInferredProjects(ctx context.Context, options *core.CompilerOptions) {
+	s.cancelScheduledSnapshotUpdate()
+	s.snapshotUpdateMu.Lock()
+	defer s.snapshotUpdateMu.Unlock()
 	s.compilerOptionsForInferredProjects = options
-	s.UpdateSnapshot(ctx, s.fs.Overlays(), SnapshotChange{
+	fileChanges, overlays, ataChanges, newConfig := s.flushChanges(ctx)
+	s.UpdateSnapshot(ctx, overlays, SnapshotChange{
 		reason:                             UpdateReasonDidChangeCompilerOptionsForInferredProjects,
+		fileChanges:                        fileChanges,
+		ataChanges:                         ataChanges,
+		newConfig:                          newConfig,
 		compilerOptionsForInferredProjects: options,
 	})
 }
@@ -1386,6 +1400,10 @@ func (s *Session) updateSnapshotRef(ctx context.Context, overlays map[tspath.Pat
 func (s *Session) updateSnapshot(ctx context.Context, overlays map[tspath.PathKey]*Overlay, change SnapshotChange, callerRef bool) *Snapshot {
 	s.snapshotMu.Lock()
 	oldSnapshot := s.snapshot
+	if oldSnapshot == nil {
+		s.snapshotMu.Unlock()
+		return nil
+	}
 	if !locale.HasLocale(ctx) {
 		ctx = s.WithCurrentLocale(ctx)
 	}
@@ -1904,6 +1922,7 @@ func (s *Session) publishProgramDiagnostics(oldSnapshot *Snapshot, newSnapshot *
 	if !s.options.PushDiagnosticsEnabled {
 		return
 	}
+	snapshotID := newSnapshot.ID()
 	if newSnapshot.UserPreferences().ValidateEnabled.IsFalse() {
 		if oldSnapshot.UserPreferences().ValidateEnabled.IsFalse() {
 			return
@@ -1911,7 +1930,7 @@ func (s *Session) publishProgramDiagnostics(oldSnapshot *Snapshot, newSnapshot *
 		for _, oldProject := range oldSnapshot.ProjectCollection.ProjectsByID().Entries() {
 			configuredID, configured := oldProject.ID().Configured()
 			if configured && oldSnapshot.ProjectCollection.GetOpenConfiguredProjects().Has(configuredID) {
-				s.publishProjectDiagnostics(s.backgroundContext(), oldProject.ConfigFileName(), nil, oldSnapshot.converters)
+				s.publishProjectDiagnostics(s.backgroundContext(), snapshotID, oldProject.ConfigFileName(), nil, oldSnapshot.converters)
 			}
 		}
 		return
@@ -1927,23 +1946,23 @@ func (s *Session) publishProgramDiagnostics(oldSnapshot *Snapshot, newSnapshot *
 		newProjects,
 		func(_ ID, addedProject *Project) {
 			configuredID, configured := addedProject.ID().Configured()
-			if !shouldPublishProgramDiagnostics(addedProject, newSnapshot.ID()) || !configured || !newOpenProjects.Has(configuredID) {
+			if !shouldPublishProgramDiagnostics(addedProject, snapshotID) || !configured || !newOpenProjects.Has(configuredID) {
 				return
 			}
-			s.publishProjectDiagnostics(ctx, addedProject.ConfigFileName(), addedProject.GetProjectDiagnostics(ctx), newSnapshot.converters)
+			s.publishProjectDiagnostics(ctx, snapshotID, addedProject.ConfigFileName(), addedProject.GetProjectDiagnostics(ctx), newSnapshot.converters)
 		},
 		func(_ ID, removedProject *Project) {
 			if removedProject.Kind != KindConfigured {
 				return
 			}
-			s.publishProjectDiagnostics(ctx, removedProject.ConfigFileName(), nil, oldSnapshot.converters)
+			s.publishProjectDiagnostics(ctx, snapshotID, removedProject.ConfigFileName(), nil, oldSnapshot.converters)
 		},
 		func(_ ID, oldProject, newProject *Project) {
 			configuredID, configured := newProject.ID().Configured()
-			if !shouldPublishProgramDiagnostics(newProject, newSnapshot.ID()) || !configured || !newOpenProjects.Has(configuredID) {
+			if !shouldPublishProgramDiagnostics(newProject, snapshotID) || !configured || !newOpenProjects.Has(configuredID) {
 				return
 			}
-			s.publishProjectDiagnostics(ctx, newProject.ConfigFileName(), newProject.GetProjectDiagnostics(ctx), newSnapshot.converters)
+			s.publishProjectDiagnostics(ctx, snapshotID, newProject.ConfigFileName(), newProject.GetProjectDiagnostics(ctx), newSnapshot.converters)
 		},
 	)
 	// Sync diagnostics for projects whose open-file state changed without a program update.
@@ -1959,12 +1978,12 @@ func (s *Session) publishProgramDiagnostics(oldSnapshot *Snapshot, newSnapshot *
 		newHasOpenFiles := newOpenProjects.Has(configuredID)
 		oldHasOpenFiles := oldOpenProjects.Has(configuredID)
 		if newHasOpenFiles && !oldHasOpenFiles &&
-			(newProject == oldProject || !shouldPublishProgramDiagnostics(newProject, newSnapshot.ID())) {
+			(newProject == oldProject || !shouldPublishProgramDiagnostics(newProject, snapshotID)) {
 			// Project reopened without a program update
-			s.publishProjectDiagnostics(ctx, newProject.ConfigFileName(), newProject.GetProjectDiagnostics(ctx), newSnapshot.converters)
+			s.publishProjectDiagnostics(ctx, snapshotID, newProject.ConfigFileName(), newProject.GetProjectDiagnostics(ctx), newSnapshot.converters)
 		} else if !newHasOpenFiles && oldHasOpenFiles {
 			// Project closed
-			s.publishProjectDiagnostics(ctx, newProject.ConfigFileName(), nil, newSnapshot.converters)
+			s.publishProjectDiagnostics(ctx, snapshotID, newProject.ConfigFileName(), nil, newSnapshot.converters)
 		}
 	}
 }
@@ -1976,7 +1995,7 @@ func shouldPublishProgramDiagnostics(p *Project, snapshotID uint64) bool {
 	return p.ProgramUpdateKind > ProgramUpdateKindCloned
 }
 
-func (s *Session) publishProjectDiagnostics(ctx context.Context, configFileName tspath.RootedFilePath, diagnostics []*ast.Diagnostic, converters *lsconv.Converters) {
+func (s *Session) publishProjectDiagnostics(ctx context.Context, snapshotID uint64, configFileName tspath.RootedFilePath, diagnostics []*ast.Diagnostic, converters *lsconv.Converters) {
 	if s.Config().ValidateEnabled.IsFalse() {
 		diagnostics = nil
 	}
@@ -1986,6 +2005,12 @@ func (s *Session) publishProjectDiagnostics(ctx context.Context, configFileName 
 		lspDiagnostics = append(lspDiagnostics, lsconv.DiagnosticToLSPPush(ctx, converters, diag))
 	}
 
+	s.programDiagnosticsMu.Lock()
+	defer s.programDiagnosticsMu.Unlock()
+	if snapshotID < s.publishedProgramDiagnostics[configFileName] {
+		return
+	}
+	s.publishedProgramDiagnostics[configFileName] = snapshotID
 	if err := s.client.PublishDiagnostics(ctx, &lsproto.PublishDiagnosticsParams{
 		Uri:         lsconv.FileNameToDocumentURI(configFileName),
 		Diagnostics: lspDiagnostics,
@@ -2011,6 +2036,10 @@ func (s *Session) publishGlobalDiagnostics(ctx context.Context) {
 
 	s.snapshotMu.RLock()
 	snapshot := s.snapshot
+	if snapshot == nil {
+		s.snapshotMu.RUnlock()
+		return
+	}
 	snapshot.ref()
 	s.snapshotMu.RUnlock()
 	defer snapshot.Deref()
@@ -2020,7 +2049,7 @@ func (s *Session) publishGlobalDiagnostics(ctx context.Context) {
 			continue
 		}
 		if project.checkerPool.TakeNewGlobalDiagnostics() {
-			s.publishProjectDiagnostics(ctx, project.ConfigFileName(), project.GetProjectDiagnostics(ctx), snapshot.converters)
+			s.publishProjectDiagnostics(ctx, snapshot.ID(), project.ConfigFileName(), project.GetProjectDiagnostics(ctx), snapshot.converters)
 		}
 	}
 }
