@@ -46,7 +46,7 @@ Tier 2 targets the highest-risk concurrent protocols outside Tier 1: file-watch 
   - `BuildOrchestratorWatch` (2 invariants): unresolved projects (`task.resolved == nil`) in `tsc -b -w` retain closed `done`/`built` channels across watch cycles, causing a `-race` data race on `task.result`, SIGSEGV in `(*BuildTask).report`, and `panic: close of closed channel`; config reloads (`GenerateGraphReusingOldTasks`) clear `task.upStream` on reused tasks without clearing `task.downStream`, leaking stale `*BuildTask` graphs unboundedly.
 - **Verified-safe negative checks:** `computeScheduleOrder` / `waitOnUpstream` DAG scheduling; `contentmapper` lease `sync.Once` close.
 
-#### Target 2: `project` Session, Watch Registry, Caches, and ATA (Complete)
+#### Target 2: `project` Session, Watch Registry, Caches, and ATA (Complete, commit `31968c9`)
 
 `tsc/internal/project` has the highest synchronization density in `tsc/internal` (44 sync primitives across 16 non-test files, 14 in `session.go` alone).
 
@@ -58,16 +58,18 @@ Tier 2 targets the highest-risk concurrent protocols outside Tier 1: file-watch 
   4. `SessionInferredOptions` (2 invariants: `InvNoLostOverlay`, `InvNoNilSnapshotClone`): `DidChangeCompilerOptionsForInferredProjects` skips `s.snapshotUpdateMu`, causing a live Go `-race` data race on `s.compilerOptionsForInferredProjects`, stale-overlay overwrite against concurrent `DidOpenFile`, and a nil-pointer dereference panic in `oldSnapshot.Clone` when racing with or called after `Session.Close()`.
 - **Verified-safe negative checks:** `publishProgramDiagnostics` vs `checkerPool.Discard()`; `updateContentMapperRegistrations` (`contentMapperRegistrationMu` + monotonic `snapshot.ID()` guard); `background.Queue` `Enqueue`/`Close` `WaitGroup` protocol.
 
-#### Target 3: `lsp` Server Lifecycle, Queueing, and Progress (In Progress)
+#### Target 3: `lsp` Server Lifecycle, Progress Actor, and Watch Registry (Complete)
 
 `tsc/internal/lsp` has 12 sync primitives across `server.go`, `dynamic_queue.go`, and `progress.go` (excluding `$/cancelRequest` queue residency covered in Tier 1 `LspServerCancel`).
 
-- **Scope:**
-  - `lsp/server.go`: `initialize` / `initialized` / `shutdown` / `exit` state transitions, concurrent request dispatch vs shutdown teardown, `watchers` map lifecycle, `pendingServerRequests` correlation, and `client` callback ordering.
-  - `lsp/dynamic_queue.go`: `Put`, `Pop`, and close/shutdown signaling under concurrent producers and consumers.
-  - `lsp/progress.go`: progress token creation, `ProgressStart` / `ProgressFinish` refcounting, delay timer cancellation, and teardown races.
+- **Audited files:** `server.go`, `progress.go`, `logger.go`, `dynamic_queue.go`, `lsproto/baseproto.go`.
+- **Verified defects (3 TLA+ specs, 7 TLC violations, 7 confirmed Go `-race` reproducers, all novel upstream):**
+  1. `LspProgressLocale` (2 invariants: `InvNoLocaleDataRace`, `InvProgressEndsWhenIdle`): `serverProgressReporter.localize` reads `r.server.locale` without `localeMu.RLock()` (live Go `-race` data race with `Server.SetLocale`); `projectLoadingProgress.run` keys its ref-counted `loading` map by the localized string, so a locale change between `ProgressStart` and `ProgressFinish` leaks the old entry and permanently suppresses `WorkDoneProgressEnd`.
+  2. `LspServerLifecycle` (3 invariants: `InvNoPreInitNilSessionPanic`, `InvNoPostShutdownNilSnapshotPanic`, `InvNoDuplicateInitializedPanic`): document request registrars (`registerLanguageServiceDocumentRequestHandler`, `WithAutoImports`, `MultiProjectReference`) omit the `s.session == nil` guard (crashing `dispatchLoop` on pre-`initialized` requests); `handleShutdown` closes `s.session` (`snapshot = nil`) without rejecting subsequent requests or draining in-flight async handlers (crashing `dispatchLoop` on post-`shutdown` requests); `handleInitialized` closes `s.initComplete` without a `sync.Once`/idempotency guard (crashing `dispatchLoop` with `panic: close of closed channel` on duplicate `initialized`).
+  3. `LspWatchRegistry` (2 invariants: `InvTimedOutWatchCanBeUnwatched`, `InvNoDuplicateUnwatch`): `Server.WatchFiles` only adds `id` to `s.watchers` after `sendClientRequest` succeeds, so a timed-out request installed by a slow client can never be unwatched (`"no file watcher exists with ID ..."`); `Server.UnwatchFiles` checks `s.watchers.Has(id)` before the unlocked RPC and deletes afterward, letting concurrent calls send duplicate `client/unregisterCapability` RPCs.
+- **Verified-safe negative checks:** `pendingServerRequests` lock-protected channel close/delete; `handleInitialized` calling `sendClientRequest` while `readLoop` routes responses independently; `projectLoadingProgress.stopDelay` setting `delay = nil`.
 
-#### Target 4: `ipc` Async Transport and `ls/autoimport` Registry (Queued)
+#### Target 4: `ipc` Async Transport and `ls/autoimport` Registry (In Progress)
 
 - **Scope:**
   - `tsc/internal/ipc/conn_async.go`, `conn_sync.go`, `transport.go`: concurrent request multiplexing, response correlation, cancellation and close races, write serialization, and shutdown draining.

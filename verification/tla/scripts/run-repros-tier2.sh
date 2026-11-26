@@ -10,6 +10,7 @@ TMP_FILES=(
   "$TSC_DIR/internal/execute/build/tla_repro_tmp_test.go"
   "$TSC_DIR/internal/project/tla_repro_ownercache_tmp_test.go"
   "$TSC_DIR/internal/project/tla_repro_session_tmp_test.go"
+  "$TSC_DIR/internal/lsp/tla_repro_tier2_tmp_test.go"
 )
 
 cleanup() {
@@ -21,6 +22,7 @@ cp "$REPRO_DIR/fswatch_lifecycle_repro_test.go"        "$TSC_DIR/internal/fswatc
 cp "$REPRO_DIR/build_orchestrator_watch_repro_test.go" "$TSC_DIR/internal/execute/build/tla_repro_tmp_test.go"
 cp "$REPRO_DIR/ownercache_release_repro_test.go"       "$TSC_DIR/internal/project/tla_repro_ownercache_tmp_test.go"
 cp "$REPRO_DIR/session_project_repro_test.go"          "$TSC_DIR/internal/project/tla_repro_session_tmp_test.go"
+cp "$REPRO_DIR/lsp_server_tier2_repro_test.go"         "$TSC_DIR/internal/lsp/tla_repro_tier2_tmp_test.go"
 
 # Format: "<pkg>|<test-regex>|<mode>"
 #   mode=fail  -> expects --- FAIL: TestRepro...
@@ -36,6 +38,13 @@ CASES=(
   "./internal/project|^TestReproSessionProgramDiagOutOfOrderStaleOverwrite$|fail"
   "./internal/project|^TestReproSessionDidChangeInferredOptionsDataRace$|crash"
   "./internal/project|^TestReproSessionDidChangeInferredOptionsNilSnapshotPanic$|fail"
+  "./internal/lsp|^TestReproLspProgressLocaleDataRace$|crash"
+  "./internal/lsp|^TestReproLspProgressLocaleChangeSticksSpinnerForever$|fail"
+  "./internal/lsp|^TestReproLspPreInitializedDocumentRequestNilSessionPanic$|crash"
+  "./internal/lsp|^TestReproLspPostShutdownDocumentRequestNilSnapshotPanic$|crash"
+  "./internal/lsp|^TestReproLspDuplicateInitializedCloseClosedChannelPanic$|crash"
+  "./internal/lsp|^TestReproLspWatchFilesTimeoutStrandsClientRegistration$|fail"
+  "./internal/lsp|^TestReproLspWatchFilesConcurrentUnwatchDuplicateRPC$|fail"
 )
 
 total_reproduced=0

@@ -64,5 +64,12 @@ run_case SessionWatchProtocol   SessionWatchProtocol   SessionWatchProtocol_Fail
 run_case SessionProgramDiag     SessionProgramDiag     SessionProgramDiag.cfg                      12
 run_case SessionInferredOptions SessionInferredOptions SessionInferredOptions_LostOverlay.cfg      12
 run_case SessionInferredOptions SessionInferredOptions SessionInferredOptions_NilClone.cfg         12
+run_case LspProgressLocale      LspProgressLocale      LspProgressLocaleRace.cfg                   12
+run_case LspProgressLocale      LspProgressLocale      LspProgressLocaleStuck.cfg                  12
+run_case LspServerLifecycle     LspServerLifecycle     LspServerLifecyclePreInit.cfg               12
+run_case LspServerLifecycle     LspServerLifecycle     LspServerLifecyclePostShutdown.cfg          12
+run_case LspServerLifecycle     LspServerLifecycle     LspServerLifecycleDupInit.cfg               12
+run_case LspWatchRegistry       LspWatchRegistry       LspWatchRegistryTimeout.cfg                 12
+run_case LspWatchRegistry       LspWatchRegistry       LspWatchRegistryDupUnwatch.cfg              12
 
 echo "=== All expected Tier 2 TLC verdicts matched ==="
