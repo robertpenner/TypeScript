@@ -83,7 +83,18 @@ func (e *lockedEntry[K, V]) ChangeIf(cond func(V) bool, apply func(V)) bool {
 	if cur.delete || !cond(cur.value) {
 		return false
 	}
+	if e.canonical != nil {
+		// Canonical entry is already locked; cond was just evaluated against it.
+		changeCanonicalLocked(e.canonical, e.e, apply)
+		return true
+	}
 	c := e.ensureCanonical()
+	if c == e.e {
+		// Won LoadOrStore while holding e.mu continuously; cond already evaluated on e.value.
+		changeCanonicalLocked(c, e.e, apply)
+		return true
+	}
+	// Lost LoadOrStore to another canonical entry; re-check cond under c.mu.
 	return changeIfCanonicalLocked(c, e.e, cond, apply)
 }
 
@@ -238,6 +249,15 @@ func (e *SyncMapEntry[K, V]) ChangeIf(cond func(V) bool, apply func(V)) bool {
 		if !cond(e.value) {
 			return false
 		}
+		c, unlock := e.lockCanonicalLocked()
+		defer unlock()
+		if c == e {
+			// Won LoadOrStore while holding e.mu continuously; avoid evaluating cond twice.
+			changeCanonicalLocked(c, e, apply)
+			return true
+		}
+		// Lost LoadOrStore to a concurrent writer; re-check cond under c.mu.
+		return changeIfCanonicalLocked(c, e, cond, apply)
 	}
 	c, unlock := e.lockCanonicalLocked()
 	defer unlock()
@@ -275,6 +295,19 @@ func (e *SyncMapEntry[K, V]) DeleteIf(cond func(V) bool) {
 		if !cond(e.value) {
 			return
 		}
+		c, unlock := e.lockCanonicalLocked()
+		defer unlock()
+		if c == e {
+			// Won LoadOrStore while holding e.mu continuously; avoid evaluating cond twice.
+			c.delete = true
+			return
+		}
+		// Lost LoadOrStore to a concurrent writer; re-check cond under c.mu.
+		if !c.delete && cond(c.value) {
+			c.delete = true
+			e.delete = true
+		}
+		return
 	}
 	c, unlock := e.lockCanonicalLocked()
 	defer unlock()

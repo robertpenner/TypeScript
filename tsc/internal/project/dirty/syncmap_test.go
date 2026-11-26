@@ -418,4 +418,36 @@ func TestSyncMapEntryLifecycleSafety(t *testing.T) {
 		<-done2
 		assert.Assert(t, b1.Value().data == "concurrent" || b1.Value().data == "second")
 	})
+
+	t.Run("uncontended ChangeIf, DeleteIf, and Locked.ChangeIf evaluate predicate once", func(t *testing.T) {
+		t.Parallel()
+		m := NewSyncMap(map[string]*testValue{
+			"a": {data: "init"},
+			"b": {data: "init"},
+			"c": {data: "init"},
+		})
+
+		ea, _ := m.Load("a")
+		aCalls := 0
+		assert.Assert(t, ea.ChangeIf(
+			func(v *testValue) bool { aCalls++; return v.data == "init" },
+			func(v *testValue) { v.data = "changed" },
+		))
+		assert.Equal(t, aCalls, 1)
+
+		eb, _ := m.Load("b")
+		bCalls := 0
+		eb.DeleteIf(func(v *testValue) bool { bCalls++; return v.data == "init" })
+		assert.Equal(t, bCalls, 1)
+
+		ec, _ := m.Load("c")
+		cCalls := 0
+		ec.Locked(func(v Value[*testValue]) {
+			assert.Assert(t, v.ChangeIf(
+				func(val *testValue) bool { cCalls++; return val.data == "init" },
+				func(val *testValue) { val.data = "changed" },
+			))
+		})
+		assert.Equal(t, cCalls, 1)
+	})
 }
