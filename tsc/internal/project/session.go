@@ -1310,6 +1310,11 @@ func (s *Session) WithLanguageServiceAndSnapshot(
 // if other changes haven't been adopted in the meantime.
 func (s *Session) GetLanguageServiceWithAutoImports(ctx context.Context, baseSnapshot *Snapshot, uri lsproto.DocumentUri) (*ls.LanguageService, error) {
 	newSnapshot := s.CloneSnapshotWithAutoImports(ctx, baseSnapshot, uri, s.logger)
+	if err := ctx.Err(); err != nil {
+		// Clone's initial ref (1) is released since we won't adopt a cancelled clone.
+		newSnapshot.Deref()
+		return nil, err
+	}
 	project := newSnapshot.GetDefaultProject(uri)
 	if project == nil {
 		// Clone's initial ref (1) is released since we won't use this snapshot.

@@ -254,6 +254,14 @@ type RegistryBucket struct {
 	// AmbientModuleNames is considered immutable after the bucket is finalized.
 	// It should be fully replaced rather than mutated while changing a bucket.
 	AmbientModuleNames map[string][]tspath.RootedFilePath
+	// Entrypoints maps from file path to the resolved entrypoints for files in this
+	// node_modules bucket. Keeping entrypoints scoped per bucket prevents rebuilding
+	// or removing one node_modules bucket from clobbering entrypoints shared with
+	// another bucket via symlinks.
+	//
+	// Entrypoints is considered immutable after the bucket is finalized.
+	// It should be fully replaced rather than mutated while changing a bucket.
+	Entrypoints map[tspath.PathKey][]*module.ResolvedEntrypoint
 	// Index is considered immutable after the bucket is finalized.
 	// It should be cloned and replaced rather than mutated while changing a bucket.
 	Index *Index[*Export]
@@ -276,6 +284,7 @@ func (b *RegistryBucket) Clone() *RegistryBucket {
 		ResolvedPackageNames: b.ResolvedPackageNames,
 		DependencyNames:      b.DependencyNames,
 		AmbientModuleNames:   b.AmbientModuleNames,
+		Entrypoints:          b.Entrypoints,
 		Index:                b.Index,
 	}
 }
@@ -334,9 +343,6 @@ type Registry struct {
 	nodeModules        map[tspath.PathKey]*RegistryBucket
 	projects           map[ProjectID]*RegistryBucket
 	uniquePackageCount int
-
-	// entrypoints maps from file path to the resolved entrypoints for that file, shared across all node_modules buckets.
-	entrypoints map[tspath.PathKey][]*module.ResolvedEntrypoint
 
 	// specifierCache maps from importing file to target file to specifier.
 	specifierCache map[tspath.PathKey]*collections.SyncMap[tspath.PathKey, tspath.ModuleSpecifier]
@@ -519,7 +525,6 @@ type registryBuilder struct {
 	resolverOptions module.ResolverOptions
 
 	uniquePackageCount int
-	entrypoints        *dirty.MapBuilder[tspath.PathKey, []*module.ResolvedEntrypoint, []*module.ResolvedEntrypoint]
 }
 
 func newRegistryBuilder(registry *Registry, host RegistryCloneHost, currentDirectory tspath.RootedDirectoryPath) *registryBuilder {
@@ -534,7 +539,6 @@ func newRegistryBuilder(registry *Registry, host RegistryCloneHost, currentDirec
 		projects:           dirty.NewMap(registry.projects),
 		specifierCache:     dirty.NewMapBuilder(registry.specifierCache, core.Identity, core.Identity),
 		uniquePackageCount: registry.uniquePackageCount,
-		entrypoints:        dirty.NewMapBuilder(registry.entrypoints, core.Identity, core.Identity),
 	}
 }
 
@@ -547,7 +551,6 @@ func (b *registryBuilder) Build() *Registry {
 		projects:           core.FirstResult(b.projects.Finalize()),
 		specifierCache:     core.FirstResult(b.specifierCache.Build()),
 		uniquePackageCount: b.uniquePackageCount,
-		entrypoints:        b.entrypoints.Build(),
 	}
 }
 
@@ -1065,12 +1068,6 @@ func (b *registryBuilder) updateIndexes(ctx context.Context, change RegistryChan
 		if br.err != nil {
 			continue
 		}
-		for _, path := range br.removedEntrypointPaths {
-			b.entrypoints.Delete(path)
-		}
-		for path, entries := range br.entrypoints {
-			b.entrypoints.Set(path, entries)
-		}
 		br.replaceBucket(br.bucket)
 	}
 
@@ -1225,12 +1222,6 @@ type bucketBuildResult struct {
 	err            error
 
 	bucket *RegistryBucket
-	// entrypoints are the resolved entrypoints from this bucket's packages,
-	// to be merged into the registry-level entrypoints map.
-	entrypoints map[tspath.PathKey][]*module.ResolvedEntrypoint
-	// removedEntrypointPaths lists paths whose entrypoints should be removed from
-	// the registry-level map before merging new entrypoints. Used for granular updates.
-	removedEntrypointPaths []tspath.PathKey
 	// File path to filename and package name
 	possibleFailedAmbientModuleLookupSources *collections.SyncMap[tspath.PathKey, *failedAmbientModuleLookupSource]
 	// Likely ambient module name
@@ -1298,6 +1289,11 @@ func (b *registryBuilder) buildProjectBucket(
 	}
 
 	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		result.err = err
+		return
+	}
 
 	indexStart := time.Now()
 	idx := &Index[*Export]{}
@@ -1663,41 +1659,30 @@ func (b *registryBuilder) buildNodeModulesBucket(
 		}
 	}
 
+	entrypoints := make(map[tspath.PathKey][]*module.ResolvedEntrypoint, len(extraction.exports))
+	for _, entrypointSet := range extraction.entrypoints {
+		for _, entrypoint := range entrypointSet {
+			entrypoints[entrypoint.ResolvedPath] = append(entrypoints[entrypoint.ResolvedPath], entrypoint)
+		}
+	}
+
 	result.bucket = &RegistryBucket{
 		Index:              &Index[*Export]{},
 		DependencyNames:    dependencies,
 		PackageFiles:       allPackageFiles,
 		AmbientModuleNames: extraction.ambientModuleNames,
+		Entrypoints:        entrypoints,
 		Paths:              paths,
 		state: BucketState{
 			buildPreferences:        bucketBuildPreferencesFromUserPreferences(b.userPreferences),
 			recursiveSearchPackages: recursiveSearchPackages.Clone(),
 		},
 	}
-	result.entrypoints = make(map[tspath.PathKey][]*module.ResolvedEntrypoint, len(extraction.exports))
 	result.possibleFailedAmbientModuleLookupSources = extraction.possibleFailedAmbientModuleLookupSources
 	result.possibleFailedAmbientModuleLookupTargets = extraction.possibleFailedAmbientModuleLookupTargets
 	for _, fileExports := range extraction.exports {
 		for _, exp := range fileExports {
 			result.bucket.Index.insertAsWords(exp)
-		}
-	}
-	for _, entrypointSet := range extraction.entrypoints {
-		for _, entrypoint := range entrypointSet {
-			result.entrypoints[entrypoint.ResolvedPath] = append(result.entrypoints[entrypoint.ResolvedPath], entrypoint)
-		}
-	}
-
-	// Compute old entrypoint paths to remove from the registry-level map.
-	// For a full rebuild, all entrypoints belonging to the old bucket's packages must be removed.
-	if oldEntry, ok := b.nodeModules.Get(dirPath); ok {
-		oldBucket := oldEntry.Value()
-		for _, files := range oldBucket.PackageFiles {
-			for path := range files {
-				if _, ok := b.base.entrypoints[path]; ok {
-					result.removedEntrypointPaths = append(result.removedEntrypointPaths, path)
-				}
-			}
 		}
 	}
 
@@ -1785,19 +1770,28 @@ func (b *registryBuilder) updateNodeModulesBucket(
 		newAmbientModuleNames[moduleName] = append(newAmbientModuleNames[moduleName], fileNames...)
 	}
 
-	// Collect entrypoint paths that need to be removed from the registry-level map
-	// (paths belonging to dirty packages)
-	var removedEntrypointPaths []tspath.PathKey
-	for path := range b.base.entrypoints {
-		if pkgName, ok := existingBucket.Paths[path]; ok && dirtyPackages.Has(pkgName) {
-			removedEntrypointPaths = append(removedEntrypointPaths, path)
+	// Clone Entrypoints, excluding paths belonging to dirty packages, then merge
+	// newly extracted entrypoints without mutating slices from existingBucket.
+	dirtyPaths := make(map[tspath.PathKey]struct{})
+	for pkgName := range dirtyPackages.Keys() {
+		for path := range existingBucket.PackageFiles[pkgName] {
+			dirtyPaths[path] = struct{}{}
 		}
 	}
-	// Build new entrypoints from extraction
-	newEntrypoints := make(map[tspath.PathKey][]*module.ResolvedEntrypoint)
+	newEntrypoints := make(map[tspath.PathKey][]*module.ResolvedEntrypoint, len(existingBucket.Entrypoints))
+	for path, entries := range existingBucket.Entrypoints {
+		if _, dirty := dirtyPaths[path]; dirty {
+			continue
+		}
+		if pkgName, ok := existingBucket.Paths[path]; ok && dirtyPackages.Has(pkgName) {
+			continue
+		}
+		newEntrypoints[path] = entries
+	}
 	for _, entrypointSet := range extraction.entrypoints {
 		for _, entrypoint := range entrypointSet {
-			newEntrypoints[entrypoint.ResolvedPath] = append(newEntrypoints[entrypoint.ResolvedPath], entrypoint)
+			existing := newEntrypoints[entrypoint.ResolvedPath]
+			newEntrypoints[entrypoint.ResolvedPath] = append(existing[:len(existing):len(existing)], entrypoint)
 		}
 	}
 
@@ -1813,14 +1807,13 @@ func (b *registryBuilder) updateNodeModulesBucket(
 		DependencyNames:    existingBucket.DependencyNames,
 		PackageFiles:       newPackageFiles,
 		AmbientModuleNames: newAmbientModuleNames,
+		Entrypoints:        newEntrypoints,
 		Paths:              newPaths,
 		state: BucketState{
 			buildPreferences:        bucketBuildPreferencesFromUserPreferences(b.userPreferences),
 			recursiveSearchPackages: recursiveSearchPackages.Clone(),
 		},
 	}
-	result.entrypoints = newEntrypoints
-	result.removedEntrypointPaths = removedEntrypointPaths
 	result.possibleFailedAmbientModuleLookupSources = extraction.possibleFailedAmbientModuleLookupSources
 	result.possibleFailedAmbientModuleLookupTargets = extraction.possibleFailedAmbientModuleLookupTargets
 

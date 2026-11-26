@@ -1,6 +1,7 @@
 package autoimport
 
 import (
+	"github.com/microsoft/TypeScript/tsc/internal/module"
 	"github.com/microsoft/TypeScript/tsc/internal/modulespecifiers"
 	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 )
@@ -35,7 +36,7 @@ func (v *View) GetModuleSpecifier(
 	}
 
 	if export.PackageName != "" {
-		if entrypoints, ok := v.registry.entrypoints[export.Path]; ok {
+		if entrypoints, ok := v.getEntrypoints(export); ok {
 			for _, entrypoint := range entrypoints {
 				if entrypoint.IncludeConditions.IsSubsetOf(v.conditions) && !v.conditions.Intersects(entrypoint.ExcludeConditions) {
 					specifier := modulespecifiers.ProcessEntrypointEnding(
@@ -87,4 +88,24 @@ func (v *View) GetModuleSpecifier(
 	}
 	cache.Store(export.Path, "")
 	return "", modulespecifiers.ResultKindNone
+}
+
+func (v *View) getEntrypoints(export *Export) ([]*module.ResolvedEntrypoint, bool) {
+	if v.registry == nil || export.PackageName == "" {
+		return nil, false
+	}
+	var found []*module.ResolvedEntrypoint
+	var ok bool
+	v.importingFile.PathKey().Parent().ForEachAncestorDirectory(func(dirPath tspath.PathKey) (any, bool) {
+		nodeModulesBucket, hasBucket := v.registry.nodeModules[dirPath]
+		if !hasBucket {
+			return nil, false
+		}
+		if _, hasPackage := nodeModulesBucket.PackageFiles[export.PackageName]; hasPackage {
+			found, ok = nodeModulesBucket.Entrypoints[export.Path]
+			return nil, true
+		}
+		return nil, false
+	})
+	return found, ok
 }
