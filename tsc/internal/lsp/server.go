@@ -101,8 +101,9 @@ var (
 )
 
 type pendingClientRequest struct {
-	req    *lsproto.RequestMessage
-	cancel context.CancelFunc
+	req      *lsproto.RequestMessage
+	cancel   context.CancelFunc
+	canceled bool
 }
 
 type Reader interface {
@@ -997,7 +998,19 @@ func (s *Server) readLoop(ctx context.Context) error {
 					s.cancelRequest(params.Id)
 				}
 			} else {
+				if req.ID != nil {
+					s.pendingClientRequestsMu.Lock()
+					s.pendingClientRequests[*req.ID] = pendingClientRequest{req: req}
+					s.pendingClientRequestsMu.Unlock()
+				}
 				if err := s.requestQueue.Put(ctx, req); err != nil {
+					if req.ID != nil {
+						s.pendingClientRequestsMu.Lock()
+						if cur, ok := s.pendingClientRequests[*req.ID]; ok && cur.req == req {
+							delete(s.pendingClientRequests, *req.ID)
+						}
+						s.pendingClientRequestsMu.Unlock()
+					}
 					return err
 				}
 			}
@@ -1010,8 +1023,13 @@ func (s *Server) cancelRequest(rawID lsproto.IntegerOrString) {
 	s.pendingClientRequestsMu.Lock()
 	defer s.pendingClientRequestsMu.Unlock()
 	if pendingReq, ok := s.pendingClientRequests[*id]; ok {
-		pendingReq.cancel()
-		delete(s.pendingClientRequests, *id)
+		if pendingReq.cancel != nil {
+			pendingReq.cancel()
+			delete(s.pendingClientRequests, *id)
+		} else {
+			pendingReq.canceled = true
+			s.pendingClientRequests[*id] = pendingReq
+		}
 	}
 }
 
@@ -1032,8 +1050,16 @@ func (s *Server) dispatchLoop(ctx context.Context) error {
 		requestCtx := locale.WithLocale(ctx, s.GetLocale())
 		var cancel context.CancelFunc
 		if req.ID != nil {
-			requestCtx, cancel = context.WithCancel(core.WithRequestID(requestCtx, req.ID.String()))
 			s.pendingClientRequestsMu.Lock()
+			if pendingReq, ok := s.pendingClientRequests[*req.ID]; ok && pendingReq.req == req && pendingReq.canceled {
+				delete(s.pendingClientRequests, *req.ID)
+				s.pendingClientRequestsMu.Unlock()
+				if err := s.sendError(req.ID, lsproto.ErrorCodeRequestCancelled); err != nil {
+					lspExit(err)
+				}
+				continue
+			}
+			requestCtx, cancel = context.WithCancel(core.WithRequestID(requestCtx, req.ID.String()))
 			s.pendingClientRequests[*req.ID] = pendingClientRequest{
 				req:    req,
 				cancel: cancel,
@@ -1060,7 +1086,9 @@ func (s *Server) dispatchLoop(ctx context.Context) error {
 				defer cancel()
 				s.pendingClientRequestsMu.Lock()
 				defer s.pendingClientRequestsMu.Unlock()
-				delete(s.pendingClientRequests, *req.ID)
+				if cur, ok := s.pendingClientRequests[*req.ID]; ok && cur.req == req {
+					delete(s.pendingClientRequests, *req.ID)
+				}
 			}
 		}
 
