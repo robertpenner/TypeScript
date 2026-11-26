@@ -564,9 +564,11 @@ type Session struct {
 	closeOnce sync.Once
 
 	// This is set to true when using TupleProtocol.
-	useBinaryResponses      bool
-	batchResponsePages      sync.Map
-	nextBatchResponsePageID atomic.Uint64
+	useBinaryResponses       bool
+	batchResponsePagesMu     sync.Mutex
+	batchResponsePages       map[string]batchResponsePage
+	batchResponsePagesClosed bool
+	nextBatchResponsePageID  atomic.Uint64
 
 	// snapshots maps snapshot handles to their data. Each snapshot has its own
 	// symbol/type registries.
@@ -578,14 +580,16 @@ type Session struct {
 	// snapshot creation bookkeeping takes it for writing. This is what
 	// lets queries against an existing snapshot run concurrently with the building of
 	// the next one.
-	snapshots   map[SnapshotID]*snapshotData
-	snapshotsMu sync.RWMutex
+	snapshots       map[SnapshotID]*snapshotData
+	snapshotsClosed bool
+	snapshotsMu     sync.RWMutex
 
 	// openProjects, openFiles, and createdPrograms are the canonical LSP-state resources
 	// owned by this API client. Guarded by languageServerUpdateMu.
-	openProjects    collections.Set[tspath.PathKey]
-	openFiles       collections.Set[tspath.PathKey]
-	createdPrograms collections.Set[project.SyntheticProjectID]
+	openProjects         collections.Set[tspath.PathKey]
+	openFiles            collections.Set[tspath.PathKey]
+	createdPrograms      collections.Set[project.SyntheticProjectID]
+	languageServerClosed bool
 
 	languageServerUpdateMu sync.Mutex
 
@@ -599,11 +603,14 @@ type Session struct {
 	programResolutionContexts      map[uint64]*programResolutionContext
 	programResolutionContextsMu    sync.RWMutex
 	sourceFileLeases               map[SourceFileLeaseID]*project.SourceFileLease
+	sourceFileLeasesClosed         bool
 	sourceFileLeasesMu             sync.Mutex
 	nextSourceFileLeaseID          atomic.Uint64
 	conn                           ipc.Conn
 
-	cpuProfiler pprof.CPUProfiler
+	cpuProfilerMu     sync.Mutex
+	cpuProfilerClosed bool
+	cpuProfiler       pprof.CPUProfiler
 }
 
 type batchResponsePage struct {
@@ -1314,11 +1321,19 @@ func (s *Session) HandleRequest(ctx context.Context, method string, params json.
 
 func (s *Session) handleBatchRequests(ctx context.Context, params *BatchRequestsParams) (*BatchRequestsResponse, error) {
 	if params.ContinuationToken != "" {
-		value, ok := s.batchResponsePages.LoadAndDelete(params.ContinuationToken)
+		s.batchResponsePagesMu.Lock()
+		if s.batchResponsePagesClosed {
+			s.batchResponsePagesMu.Unlock()
+			return nil, fmt.Errorf("%w: session is closed", ErrClientError)
+		}
+		page, ok := s.batchResponsePages[params.ContinuationToken]
+		if ok {
+			delete(s.batchResponsePages, params.ContinuationToken)
+		}
+		s.batchResponsePagesMu.Unlock()
 		if !ok {
 			return nil, fmt.Errorf("%w: invalid batch continuation token", ErrClientError)
 		}
-		page := value.(batchResponsePage)
 		return s.paginateBatchResponses(page, nil, params.MaxResponseBytesPerPage)
 	}
 
@@ -1387,9 +1402,18 @@ func (s *Session) paginateBatchResponses(page batchResponsePage, responses []Bat
 	if responses != nil {
 		response.Responses = responses[:pageLength]
 	}
-	s.batchResponsePages.Store(continuationToken, batchResponsePage{
+	s.batchResponsePagesMu.Lock()
+	if s.batchResponsePagesClosed {
+		s.batchResponsePagesMu.Unlock()
+		return nil, fmt.Errorf("%w: session is closed", ErrClientError)
+	}
+	if s.batchResponsePages == nil {
+		s.batchResponsePages = make(map[string]batchResponsePage)
+	}
+	s.batchResponsePages[continuationToken] = batchResponsePage{
 		encodedResponses: remainingResponses,
-	})
+	}
+	s.batchResponsePagesMu.Unlock()
 	return response, nil
 }
 
@@ -1445,6 +1469,11 @@ func (s *Session) handleStartCPUProfile(_ context.Context, params *ProfileParams
 		return nil, fmt.Errorf("%w: dir is required", ErrClientError)
 	}
 	profileDirectory := tspath.ToRootedDirectoryPath(params.Dir, s.currentDirectory())
+	s.cpuProfilerMu.Lock()
+	defer s.cpuProfilerMu.Unlock()
+	if s.cpuProfilerClosed {
+		return nil, fmt.Errorf("%w: session is closed", ErrClientError)
+	}
 	if err := s.cpuProfiler.StartCPUProfile(profileDirectory.AsString()); err != nil {
 		return nil, fmt.Errorf("%w: failed to start CPU profile: %w", ErrClientError, err)
 	}
@@ -1452,6 +1481,8 @@ func (s *Session) handleStartCPUProfile(_ context.Context, params *ProfileParams
 }
 
 func (s *Session) handleStopCPUProfile(_ context.Context) (*ProfileResult, error) {
+	s.cpuProfilerMu.Lock()
+	defer s.cpuProfilerMu.Unlock()
 	filePath, err := s.cpuProfiler.StopCPUProfile()
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to stop CPU profile: %w", ErrClientError, err)
@@ -1529,7 +1560,9 @@ func (s *Session) handleCreateSnapshot(ctx context.Context, params *CreateSnapsh
 	}
 
 	response := s.createSnapshotResponse(snapshot, nil, &params.SnapshotRequestChangesParams)
-	s.registerSnapshot(snapshot, openState, snapshotFileSystem)
+	if err := s.registerSnapshot(snapshot, openState, snapshotFileSystem); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
@@ -1585,7 +1618,9 @@ func (s *Session) handleUpdateSnapshot(ctx context.Context, params *UpdateSnapsh
 	}
 
 	response := s.createSnapshotResponse(snapshot, baseSD.snapshot, &changes.SnapshotRequestChangesParams)
-	s.registerSnapshot(snapshot, openState, snapshotFileSystem)
+	if err := s.registerSnapshot(snapshot, openState, snapshotFileSystem); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
@@ -1862,11 +1897,16 @@ func (s *Session) reconcileSnapshotOpens(apiRequest *project.APISnapshotRequest,
 	return state
 }
 
-func (s *Session) registerSnapshot(snapshot *project.Snapshot, openState snapshotOpenState, fileSystem vfs.FS) {
+func (s *Session) registerSnapshot(snapshot *project.Snapshot, openState snapshotOpenState, fileSystem vfs.FS) error {
 	// If the same snapshot ID is returned (no changes), we increment the ref count
 	// so each client-side Snapshot can be disposed independently.
 	handle := snapshotHandle(snapshot)
 	s.snapshotsMu.Lock()
+	if s.snapshotsClosed {
+		s.snapshotsMu.Unlock()
+		snapshot.Deref()
+		return fmt.Errorf("%w: session is closed", ErrClientError)
+	}
 	sd, exists := s.snapshots[handle]
 	if exists {
 		// Same snapshot already stored — release the caller's ref since
@@ -1888,6 +1928,7 @@ func (s *Session) registerSnapshot(snapshot *project.Snapshot, openState snapsho
 		s.snapshots[handle] = sd
 	}
 	s.snapshotsMu.Unlock()
+	return nil
 }
 
 func (s *Session) handleGetCurrentLanguageServerSnapshot(ctx context.Context, params *GetCurrentLanguageServerSnapshotParams) (*CreateSnapshotResponse, error) {
@@ -1906,6 +1947,9 @@ func (s *Session) handleGetCurrentLanguageServerSnapshot(ctx context.Context, pa
 
 	s.languageServerUpdateMu.Lock()
 	defer s.languageServerUpdateMu.Unlock()
+	if s.languageServerClosed {
+		return nil, fmt.Errorf("%w: session is closed", ErrClientError)
+	}
 
 	changes := params.Changes
 	if changes == nil {
@@ -1923,7 +1967,9 @@ func (s *Session) handleGetCurrentLanguageServerSnapshot(ctx context.Context, pa
 
 	update.commit(s, snapshot)
 	response := s.createSnapshotResponse(snapshot, baseSnapshot, &changes.SnapshotRequestChangesParams)
-	s.registerSnapshot(snapshot, snapshotOpenState{openProjects: s.openProjects, openFiles: s.openFiles}, nil)
+	if err := s.registerSnapshot(snapshot, snapshotOpenState{openProjects: s.openProjects, openFiles: s.openFiles}, nil); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
@@ -2264,7 +2310,10 @@ func (s *Session) encodeLeasedSourceFile(lease *project.SourceFileLease) (any, e
 		return nil, fmt.Errorf("failed to encode source file: %w", err)
 	}
 	encoder.SetSourceFileID(data, sourceFileNodeID(lease.SourceFile()))
-	id := s.registerSourceFileLease(lease)
+	id, err := s.registerSourceFileLease(lease)
+	if err != nil {
+		return nil, err
+	}
 	encoder.SetSourceFileLease(data, uint64(id))
 	if s.useBinaryResponses {
 		return RawBinary(data), nil
@@ -2277,8 +2326,12 @@ func (s *Session) handleRetainSourceFile(params *RetainSourceFileParams) (*Retai
 	if err != nil {
 		return nil, err
 	}
+	id, err := s.registerSourceFileLease(lease)
+	if err != nil {
+		return nil, err
+	}
 	return &RetainSourceFileResponse{
-		Lease: s.registerSourceFileLease(lease),
+		Lease: id,
 	}, nil
 }
 
@@ -2336,12 +2389,17 @@ func (s *Session) acquireCachedSourceFile(descriptor SourceFileDescriptor) (*pro
 	return lease, nil
 }
 
-func (s *Session) registerSourceFileLease(lease *project.SourceFileLease) SourceFileLeaseID {
-	id := SourceFileLeaseID(s.nextSourceFileLeaseID.Add(1))
+func (s *Session) registerSourceFileLease(lease *project.SourceFileLease) (SourceFileLeaseID, error) {
 	s.sourceFileLeasesMu.Lock()
+	if s.sourceFileLeasesClosed {
+		s.sourceFileLeasesMu.Unlock()
+		lease.Release()
+		return 0, fmt.Errorf("%w: session is closed", ErrClientError)
+	}
+	id := SourceFileLeaseID(s.nextSourceFileLeaseID.Add(1))
 	s.sourceFileLeases[id] = lease
 	s.sourceFileLeasesMu.Unlock()
-	return id
+	return id, nil
 }
 
 func newSourceFileDescriptor(sourceFile *ast.SourceFile) SourceFileDescriptor {
@@ -2418,6 +2476,7 @@ func (s *Session) handleReleaseSourceFile(params *ReleaseSourceFileParams) (any,
 
 func (s *Session) releaseSourceFileLeases() {
 	s.sourceFileLeasesMu.Lock()
+	s.sourceFileLeasesClosed = true
 	leases := make([]*project.SourceFileLease, 0, len(s.sourceFileLeases))
 	for _, lease := range s.sourceFileLeases {
 		leases = append(leases, lease)
@@ -5792,6 +5851,7 @@ func (s *Session) Close() {
 		s.releaseSourceFileLeases()
 
 		s.snapshotsMu.Lock()
+		s.snapshotsClosed = true
 		snapshots := make([]*project.Snapshot, 0, len(s.snapshots))
 		for _, sd := range s.snapshots {
 			snapshots = append(snapshots, sd.snapshot)
@@ -5802,20 +5862,28 @@ func (s *Session) Close() {
 			snapshot.Deref()
 		}
 
+		s.cpuProfilerMu.Lock()
+		s.cpuProfilerClosed = true
+		_, _ = s.cpuProfiler.StopCPUProfile()
+		s.cpuProfilerMu.Unlock()
+
 		if s.ownsSnapshotHost {
 			s.snapshotHost.Close()
 		}
-		s.batchResponsePages.Clear()
+		s.batchResponsePagesMu.Lock()
+		s.batchResponsePagesClosed = true
+		clear(s.batchResponsePages)
+		s.batchResponsePagesMu.Unlock()
 	})
 }
 
 func (s *Session) releaseLanguageServerRefs() {
+	s.languageServerUpdateMu.Lock()
+	defer s.languageServerUpdateMu.Unlock()
+	s.languageServerClosed = true
 	if s.projectSession == nil {
 		return
 	}
-
-	s.languageServerUpdateMu.Lock()
-	defer s.languageServerUpdateMu.Unlock()
 	if s.openProjects.Len() == 0 && s.openFiles.Len() == 0 && s.createdPrograms.Len() == 0 {
 		return
 	}
