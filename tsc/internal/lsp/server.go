@@ -204,7 +204,8 @@ type Server struct {
 	watchEnabled     bool
 	telemetryEnabled bool
 	watcherID        atomic.Uint32
-	watchers         collections.SyncSet[project.WatcherID]
+	watchersMu       sync.Mutex
+	watchers         map[project.WatcherID]struct{}
 
 	// contentMapperRegistrationMu serializes RegisterContentMapperSelectors so the method is correctly
 	// synchronized on its own rather than relying on callers to serialize it. It guards
@@ -302,9 +303,24 @@ func (s *Server) WatchFiles(ctx context.Context, id project.WatcherID, watchers 
 		if err := s.builtinWatcher.WatchFiles(string(id), watchers); err != nil {
 			return fmt.Errorf("failed to register file watcher: %w", err)
 		}
-		s.watchers.Add(id)
+		s.watchersMu.Lock()
+		if s.watchers == nil {
+			s.watchers = make(map[project.WatcherID]struct{})
+		}
+		s.watchers[id] = struct{}{}
+		s.watchersMu.Unlock()
 		return nil
 	}
+
+	// Record the watcher before sending the RPC so a timed-out or cancelled wait
+	// whose registration still completes on the client can later be unwatched.
+	s.watchersMu.Lock()
+	if s.watchers == nil {
+		s.watchers = make(map[project.WatcherID]struct{})
+	}
+	s.watchers[id] = struct{}{}
+	s.watchersMu.Unlock()
+
 	_, err := s.sendClientRequest(ctx, lsproto.ClientRegisterCapabilityInfo, &lsproto.RegistrationParams{
 		Registrations: []*lsproto.Registration{
 			{
@@ -318,43 +334,59 @@ func (s *Server) WatchFiles(ctx context.Context, id project.WatcherID, watchers 
 		},
 	})
 	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			s.watchersMu.Lock()
+			delete(s.watchers, id)
+			s.watchersMu.Unlock()
+		}
 		return fmt.Errorf("failed to register file watcher: %w", err)
 	}
 
-	s.watchers.Add(id)
 	return nil
 }
 
 // UnwatchFiles implements project.Client.
 func (s *Server) UnwatchFiles(ctx context.Context, id project.WatcherID) error {
+	// Atomically claim the watcher ID before performing I/O so concurrent
+	// UnwatchFiles calls send at most one unregister operation per ID.
+	s.watchersMu.Lock()
+	_, exists := s.watchers[id]
+	if exists {
+		delete(s.watchers, id)
+	}
+	s.watchersMu.Unlock()
+	if !exists {
+		return fmt.Errorf("no file watcher exists with ID %s", id)
+	}
+
 	if s.builtinWatcher != nil {
-		if !s.watchers.Has(id) {
-			return fmt.Errorf("no file watcher exists with ID %s", id)
-		}
 		if err := s.builtinWatcher.UnwatchFiles(string(id)); err != nil {
+			s.watchersMu.Lock()
+			s.watchers[id] = struct{}{}
+			s.watchersMu.Unlock()
 			return fmt.Errorf("failed to unregister file watcher: %w", err)
 		}
-		s.watchers.Delete(id)
 		return nil
 	}
-	if s.watchers.Has(id) {
-		_, err := s.sendClientRequest(ctx, lsproto.ClientUnregisterCapabilityInfo, &lsproto.UnregistrationParams{
-			Unregisterations: []*lsproto.Unregistration{
-				{
-					Id:     string(id),
-					Method: string(lsproto.MethodWorkspaceDidChangeWatchedFiles),
-				},
+
+	_, err := s.sendClientRequest(ctx, lsproto.ClientUnregisterCapabilityInfo, &lsproto.UnregistrationParams{
+		Unregisterations: []*lsproto.Unregistration{
+			{
+				Id:     string(id),
+				Method: string(lsproto.MethodWorkspaceDidChangeWatchedFiles),
 			},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to unregister file watcher: %w", err)
+		},
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.watchersMu.Lock()
+			s.watchers[id] = struct{}{}
+			s.watchersMu.Unlock()
 		}
-
-		s.watchers.Delete(id)
-		return nil
+		return fmt.Errorf("failed to unregister file watcher: %w", err)
 	}
 
-	return fmt.Errorf("no file watcher exists with ID %s", id)
+	return nil
 }
 
 const (

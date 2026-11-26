@@ -7,6 +7,7 @@ import (
 	"github.com/microsoft/TypeScript/tsc/internal/collections"
 	"github.com/microsoft/TypeScript/tsc/internal/core"
 	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
+	"github.com/microsoft/TypeScript/tsc/internal/locale"
 	"github.com/microsoft/TypeScript/tsc/internal/lsp/lsproto"
 )
 
@@ -14,6 +15,17 @@ type progressEvent struct {
 	message *diagnostics.Message
 	args    []any
 	finish  bool
+}
+
+type progressKey struct {
+	message     *diagnostics.Message
+	defaultText string
+}
+
+type progressEntry struct {
+	message *diagnostics.Message
+	args    []any
+	count   int
 }
 
 // progressReporter abstracts the LSP transport operations needed by
@@ -40,7 +52,7 @@ func (r *serverProgressReporter) done() <-chan struct{} {
 }
 
 func (r *serverProgressReporter) localize(msg *diagnostics.Message, args ...any) string {
-	return msg.Localize(r.server.locale, args...)
+	return msg.Localize(r.server.GetLocale(), args...)
 }
 
 func (r *serverProgressReporter) createWorkDoneProgress(token string) {
@@ -109,7 +121,7 @@ func (p *projectLoadingProgress) finish(message *diagnostics.Message, args ...an
 // It owns all mutable state: no external synchronization needed.
 func (p *projectLoadingProgress) run() {
 	var (
-		loading collections.OrderedMap[string, int]
+		loading collections.OrderedMap[progressKey, progressEntry]
 		token   string // current token; empty if no progress active
 		tokenID int
 		begun   bool // whether "begin" has been sent for the current token
@@ -133,10 +145,17 @@ func (p *projectLoadingProgress) run() {
 	for {
 		select {
 		case ev := <-p.ch:
-			text := p.reporter.localize(ev.message, ev.args...)
+			key := progressKey{
+				message:     ev.message,
+				defaultText: ev.message.Localize(locale.Default, ev.args...),
+			}
 			if !ev.finish {
-				count := loading.GetOrZero(text)
-				loading.Set(text, count+1)
+				entry := loading.GetOrZero(key)
+				loading.Set(key, progressEntry{
+					message: ev.message,
+					args:    ev.args,
+					count:   entry.count + 1,
+				})
 				if token == "" {
 					tokenID++
 					token = fmt.Sprintf("typescript-loading-%d", tokenID)
@@ -150,14 +169,16 @@ func (p *projectLoadingProgress) run() {
 					}
 				}
 				if delayFired {
+					text := p.reporter.localize(ev.message, ev.args...)
 					begun = p.beginOrReport(token, text, begun)
 				}
 			} else {
-				count := loading.GetOrZero(text)
-				if count <= 1 {
-					loading.Delete(text)
+				entry := loading.GetOrZero(key)
+				if entry.count <= 1 {
+					loading.Delete(key)
 				} else {
-					loading.Set(text, count-1)
+					entry.count--
+					loading.Set(key, entry)
 				}
 				if token == "" {
 					continue
@@ -171,10 +192,11 @@ func (p *projectLoadingProgress) run() {
 					stopDelay()
 					token = ""
 				} else if delayFired {
-					first := core.FirstOrNilSeq(loading.Keys())
+					first := core.FirstOrNilSeq(loading.Values())
+					text := p.reporter.localize(first.message, first.args...)
 					p.reporter.sendProgress(token, lsproto.WorkDoneProgressBeginOrReportOrEnd{
 						Report: &lsproto.WorkDoneProgressReport{
-							Message: &first,
+							Message: &text,
 						},
 					})
 				}
@@ -184,8 +206,9 @@ func (p *projectLoadingProgress) run() {
 			delayFired = true
 			if token != "" && loading.Size() > 0 {
 				p.reporter.createWorkDoneProgress(token)
-				first := core.FirstOrNilSeq(loading.Keys())
-				begun = p.beginOrReport(token, first, begun)
+				first := core.FirstOrNilSeq(loading.Values())
+				text := p.reporter.localize(first.message, first.args...)
+				begun = p.beginOrReport(token, text, begun)
 			}
 
 		case <-p.reporter.done():
