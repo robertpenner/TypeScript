@@ -190,8 +190,11 @@ type Session struct {
 	seenProjects collections.SyncSet[ID]
 
 	// watches tracks the current watch globs and how many individual WatchedFiles
-	// are using each glob.
-	watches *watchRegistry
+	// are using each glob. lastWatchUpdateDone chains watch updates in snapshot
+	// adoption order under snapshotMu so later snapshot transitions cannot
+	// overtake earlier in-flight WatchFiles/UnwatchFiles RPCs.
+	watches             *watchRegistry
+	lastWatchUpdateDone chan struct{}
 
 	// globalDiagPublishPending is set to true when a global diagnostics publish
 	// task should be enqueued. It is reset when the task runs, coalescing multiple
@@ -1414,6 +1417,12 @@ func (s *Session) updateSnapshot(ctx context.Context, overlays map[tspath.PathKe
 		oldSnapshot.Deref()
 		contentMapperTimings = s.takeContentMapperTimingDelta()
 	}
+	var prevWatchDone, curWatchDone chan struct{}
+	if s.options.WatchEnabled {
+		prevWatchDone = s.lastWatchUpdateDone
+		curWatchDone = make(chan struct{})
+		s.lastWatchUpdateDone = curWatchDone
+	}
 	s.snapshotMu.Unlock()
 
 	// Enqueue ATA updates if needed
@@ -1434,9 +1443,7 @@ func (s *Session) updateSnapshot(ctx context.Context, overlays map[tspath.PathKe
 			s.logger.Log("")
 		}
 		if s.options.WatchEnabled {
-			if err := s.updateWatches(oldSnapshot, newSnapshot); err != nil && s.options.LoggingEnabled {
-				s.logger.Log(err)
-			}
+			s.runOrderedWatchUpdate(ctx, prevWatchDone, curWatchDone, oldSnapshot, newSnapshot)
 		}
 		_ = s.updateContentMapperRegistrations(ctx, newSnapshot)
 		s.publishProgramDiagnostics(oldSnapshot, newSnapshot)
@@ -1508,11 +1515,28 @@ func (s *Session) WaitForBackgroundTasks() {
 	s.backgroundQueue.Wait()
 }
 
+func (s *Session) runOrderedWatchUpdate(ctx context.Context, prevDone, curDone chan struct{}, oldSnapshot, newSnapshot *Snapshot) {
+	defer close(curDone)
+	if prevDone != nil {
+		select {
+		case <-prevDone:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if err := s.updateWatches(oldSnapshot, newSnapshot); err != nil && s.options.LoggingEnabled {
+		s.logger.Log(err)
+	}
+}
+
 func (s *Session) updateWatch[T any](ctx context.Context, oldWatcher, newWatcher *WatchedFiles[T]) []error {
 	var errors []error
 	if newWatcher != nil {
 		w := newWatcher.Watchers()
-		watchers := append(w.WorkspaceWatchers, w.OutsideWorkspaceWatchers...)
+		watchers := slices.Concat(w.WorkspaceWatchers, w.OutsideWorkspaceWatchers)
 		if len(watchers) > 0 {
 			var newWatchers collections.OrderedMap[WatcherID, *lsproto.FileSystemWatcher]
 			for i, watcher := range watchers {
@@ -1522,6 +1546,7 @@ func (s *Session) updateWatch[T any](ctx context.Context, oldWatcher, newWatcher
 				}
 			}
 			var watchErrors []error
+			var registeredNewIDs []WatcherID
 			for id, watcher := range newWatchers.Entries() {
 				// Create a fresh timeout per client call so earlier calls
 				// don't consume the deadline for later ones.
@@ -1530,23 +1555,29 @@ func (s *Session) updateWatch[T any](ctx context.Context, oldWatcher, newWatcher
 				callCancel()
 				if err != nil {
 					watchErrors = append(watchErrors, err)
-				} else if s.logger != nil {
-					if oldWatcher == nil {
-						s.logger.Log(fmt.Sprintf("Added new watch: %s", id))
-					} else {
-						s.logger.Log(fmt.Sprintf("Updated watch: %s", id))
+				} else {
+					registeredNewIDs = append(registeredNewIDs, id)
+					if s.logger != nil {
+						if oldWatcher == nil {
+							s.logger.Log(fmt.Sprintf("Added new watch: %s", id))
+						} else {
+							s.logger.Log(fmt.Sprintf("Updated watch: %s", id))
+						}
+						s.logger.Log("\t" + fileSystemWatcherGlobString(watcher))
+						s.logger.Log("")
 					}
-					s.logger.Log("\t" + fileSystemWatcherGlobString(watcher))
-					s.logger.Log("")
 				}
 			}
 			if len(watchErrors) > 0 {
-				// Roll back ALL newly-acquired watchers on any failure to keep
-				// refcounts clean. On retry, Acquire will see them as new again.
-				// Re-registering an already-registered watcher with the client
-				// is harmless (registerCapability with the same ID replaces it).
-				for _, watcher := range newWatchers.Entries() {
+				// Roll back all watchers acquired by this call so neither
+				// shared nor newly-registered globs retain phantom refcounts.
+				for _, watcher := range watchers {
 					s.watches.Release(watcher)
+				}
+				for _, id := range registeredNewIDs {
+					callCtx, callCancel := context.WithTimeout(ctx, watchRequestTimeout)
+					_ = s.client.UnwatchFiles(callCtx, id)
+					callCancel()
 				}
 				s.watches.MarkPending(w.WatcherID)
 				errors = append(errors, watchErrors...)
@@ -1565,22 +1596,29 @@ func (s *Session) updateWatch[T any](ctx context.Context, oldWatcher, newWatcher
 	}
 	if oldWatcher != nil {
 		w := oldWatcher.Watchers()
-		watchers := append(w.WorkspaceWatchers, w.OutsideWorkspaceWatchers...)
-		if len(watchers) > 0 {
-			var removedIDs []WatcherID
-			for _, watcher := range watchers {
-				if id, removed := s.watches.Release(watcher); removed {
-					removedIDs = append(removedIDs, id)
+		if s.watches.IsPending(w.WatcherID) {
+			// Registration for oldWatcher failed and rolled back its
+			// acquisitions; clear the pending mark without releasing shared
+			// globs owned by other watchers.
+			s.watches.ClearPending(w.WatcherID)
+		} else {
+			watchers := slices.Concat(w.WorkspaceWatchers, w.OutsideWorkspaceWatchers)
+			if len(watchers) > 0 {
+				var removedIDs []WatcherID
+				for _, watcher := range watchers {
+					if id, removed := s.watches.Release(watcher); removed {
+						removedIDs = append(removedIDs, id)
+					}
 				}
-			}
-			for _, id := range removedIDs {
-				callCtx, callCancel := context.WithTimeout(ctx, watchRequestTimeout)
-				err := s.client.UnwatchFiles(callCtx, id)
-				callCancel()
-				if err != nil {
-					errors = append(errors, err)
-				} else if s.logger != nil && newWatcher == nil {
-					s.logger.Log(fmt.Sprintf("Removed watch: %s", id))
+				for _, id := range removedIDs {
+					callCtx, callCancel := context.WithTimeout(ctx, watchRequestTimeout)
+					err := s.client.UnwatchFiles(callCtx, id)
+					callCancel()
+					if err != nil {
+						errors = append(errors, err)
+					} else if s.logger != nil && newWatcher == nil {
+						s.logger.Log(fmt.Sprintf("Removed watch: %s", id))
+					}
 				}
 			}
 		}
