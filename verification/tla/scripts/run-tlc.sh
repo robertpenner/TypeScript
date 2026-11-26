@@ -64,6 +64,7 @@ run_case DirtySyncMap           DirtySyncMap           DirtySyncMap_NoDataRace.c
 run_case DirtySyncMap           DirtySyncMap           DirtySyncMap_NoMutateDeleted.cfg       12
 run_case DirtySyncMap           DirtySyncMap           DirtySyncMap_NoChangeIfTOCTOU.cfg      12
 run_case DirtySyncMap           DirtySyncMap           DirtySyncMap_NoLostDelete.cfg          12
+run_case DirtySyncMap           DirtySyncMapFixed      DirtySyncMapFixed.cfg                   0
 run_case RefCountCache          RefCountCache          RefCountCache_Strict.cfg                0
 run_case RefCountCache          RefCountCache          RefCountCache_ConcRef.cfg              12
 run_case RefCountCache          RefCountCache          RefCountCache_ConcRef_Overwrite.cfg    12
