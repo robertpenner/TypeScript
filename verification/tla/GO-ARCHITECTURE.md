@@ -5,11 +5,11 @@ Companion reports: [`FINDINGS.md`](./FINDINGS.md) (Tier 1), [`ANALYSIS.md`](./AN
 
 ## Overview
 
-Formal verification with TLA+ and deterministic Go `-race` reproducers has confirmed **22 concurrency and state-machine defects** across `tsc/internal` (17 in Tier 1 across 9 components, plus 5 in Tier 2 Target 1 across `fswatch` and `execute/build`), alongside active Target 2 audit leads in `project.Session` and `OwnerCache`.
+Formal verification with TLA+ and deterministic Go `-race` reproducers has confirmed **36 concurrency and state-machine defects** across `tsc/internal` (17 in Tier 1 across 9 components, plus 19 in Tier 2 Targets 1 to 3 across `fswatch`, `execute/build`, `project`, and `lsp`), with Target 4 specs for `ls/autoimport` and `ipc` underway.
 
-These failures share a structural theme. TypeScript 7 runs a Go compiler and language server whose concurrency needs split cleanly into two different modes, yet `tsc/internal` applies fine-grained shared-memory locking (`collections.SyncMap`, per-entry `sync.Mutex`, standalone `atomic.Bool` flags, and unbounded `go func()` calls) across stateful I/O orchestration where Go favors single-owner loops, coalescing reconcilers, and explicit lifecycle ownership.
+These failures share a structural theme. TypeScript 7 runs a Go compiler and language server whose concurrency needs split cleanly into two different modes, yet `tsc/internal` applies fine-grained shared-memory locking (`collections.SyncMap`, per-entry `sync.Mutex`, standalone `atomic.Bool` flags, and unbounded `go func()` calls) across stateful I/O orchestration where Go favors explicit state machines, single-owner actor loops, and level-triggered reconcilers.
 
-This document synthesizes the verified defect patterns into a concrete target concurrency architecture in idiomatic Go.
+This document synthesizes the verified defect patterns into a target Go concurrency architecture and evaluates where flat finite state machines versus hierarchical statecharts with actors (XState-style) fit best.
 
 ---
 
@@ -34,13 +34,15 @@ In idiomatic Go, control-plane state machines are owned by **one goroutine** (an
 
 | Verified Defect / Audit Cluster | Current Mechanism | Idiomatic Go Replacement |
 |---|---|---|
-| `SessionGlobalDiag` (Tier 1); Target 2 `updateWatches`, `publishProgramDiagnostics` | Unbounded `go func()` in `background.Queue.Enqueue` + separate `atomic.Bool` latch reset in `defer` | **Level-triggered coalescing reconciler**: `atomic.Pointer[Snapshot]` + 1-buffered `chan struct{}` feeding one serial goroutine owning `applied` state |
+| `SessionGlobalDiag` (Tier 1); `SessionWatchProtocol` 3 defects, `SessionProgramDiag` (Tier 2) | Unbounded `go func()` in `background.Queue.Enqueue` + separate `atomic.Bool` latch reset in `defer` | **Level-triggered coalescing reconciler**: `atomic.Pointer[Snapshot]` + 1-buffered `chan struct{}` feeding one serial goroutine owning `applied` state |
+| `SessionInferredOptions` 2 defects (Tier 2) | `DidChangeCompilerOptionsForInferredProjects` skips `snapshotUpdateMu` and clones nil snapshot after `Close` | **Coordinator actor or single session mutex** with explicit `Open -> Closing -> Closed` lifecycle |
+| `LspServerLifecycle` 3 panics (Tier 2); `LspServerCancel` (Tier 1) | Implicit lifecycle across `initializeParams`, `session`, `initComplete`; `readLoop` enqueues before `dispatchLoop` registers cancellation | **Root supervising actor + 5-state FSM** (`Uninitialized -> Initializing -> Running -> Draining -> ShutDown`) registering cancellation on ingress and draining child workers before `session.Close()` |
+| `LspProgressLocale` 2 defects (Tier 2); `LspWatchRegistry` 2 defects (Tier 2) | Unlocked `locale` read + localized-string refcount key; `s.watchers` checked/updated outside unlocked RPC | **Child actors / explicit per-ID FSM** (`Idle / Delayed / Active` keyed by stable message ID; `Idle / Registering / Active / Unregistering / Uncertain` per watch ID) |
 | `FSWatchDebounce` (Tier 1); `FSWatchLifecycle` 3 invariants (Tier 2); `LspWatcher` 2 defects (Tier 1) | 3 to 5 independent mutexes unlocked across OS watch registration, callback teardown, and debounce timer | **Single-owner event loop** (`select` over commands, identity-tagged OS events, and `time.Timer`), or one mutex with generation/pointer identity checks |
 | `ApiSessionSnapshot` 2 defects (Tier 1); `ContentMapperHost` 2 defects (Tier 1) | Returning unretained pointers (`getSnapshotData`) or dropping `h.mu` before child-process RPC without checking closed/handle state | **Scoped lease / borrow API** (`withSnapshot` or mandatory `Acquire`/`Release` handle checking `closed` under the same lock) |
-| `RefCountCache` 3 defects (Tier 1); Target 2 `OwnerCache.Release` blind delete | Implicit lifecycle via `refCount <= 0 && !DisableDeletion` and unconditional `entries.Delete(key)` | **Explicit lifecycle enum** (`pending`/`ready`/`failed`/`deleted`) + `sync.Map.CompareAndDelete(key, entry)` (or pointer-checked delete under one mutex) |
+| `RefCountCache` 3 defects (Tier 1); `OwnerCacheRelease` (Tier 2) | Implicit lifecycle via `refCount <= 0 && !DisableDeletion` and unconditional `entries.Delete(key)` | **Explicit lifecycle enum** (`pending`/`ready`/`failed`/`deleted`) + `sync.Map.CompareAndDelete(key, entry)` (or pointer-checked delete under one mutex) |
 | `DirtySyncMap` 5 defects (Tier 1) | Two-level `SyncMap` + per-entry `sync.Mutex` + `proxyFor` forwarding + `lockedEntry` | **Fixed-shard map** (`[N]shard`, each one `sync.Mutex` + plain `map[K]*entry`) or single mutex where contention is low |
 | `ExtendedConfigDeadlock` (Tier 1; upstream `#64833`, `#65300`) | Holding `entry[A].mu` across recursive `GetExtendedConfig(B)` | **Speculative lock-free parse** outside the entry lock using goroutine-local `resolutionStack`, then publish immutable result (or single-lock cycle-aware wait graph) |
-| `LspServerCancel` (Tier 1) | `readLoop` enqueues into `requestQueue`; `dispatchLoop` later inserts into `pendingClientRequests` | **Wire-order registration**: create `context.WithCancel` and register `id -> cancel` in `readLoop` before `requestQueue.Put` |
 | `BuildOrchestratorWatch` 2 defects (Tier 2) | Reusing `*BuildTask` across watch cycles (stale closed `done`/`built` channels and unreset `downStream` slice) | **Immutable per-cycle execution state**: separate persistent config/build-info caches from fresh per-cycle task structs with fresh channels and edges |
 
 ---
@@ -136,7 +138,80 @@ Inside that loop, `add`, `trigger`, `fireCallbacks`, `unwatch`, `watchRemove`, a
 
 ---
 
-## 4. Reference Pattern Already Proven Inside `tsc/internal`: `project.checkerPool`
+## 4. Flat Finite State Machines vs. Hierarchical Statecharts and Actors (XState Model)
+
+Across the verified defects, explicit state machines and an XState-style hierarchical actor model clean up the behavioral control plane dramatically, while hot-path caches and parallel compiler pools should stay lock-free, sharded, or single-mutex.
+
+### 4.1 Where a Flat FSM Is Enough (4 to 6 States, No Hierarchy Needed)
+
+`LspServerLifecycle` (`verification/tla/specs/LspServerLifecycle/LspServerLifecycle.tla`) shows the cost of implicit state encoded across separate fields (`initializeParams != nil`, `session != nil`, `session.snapshot != nil`, and an unguarded `close(initComplete)`). All three panics collapse under one explicit lifecycle enum checked at the dispatch entry point:
+
+```text
+Uninitialized --initialize--> Initializing --initialized--> Running --shutdown--> Draining --inFlight==0--> ShutDown
+```
+
+- Document requests in `Uninitialized` or `Initializing` are rejected before touching `s.session` (`InvNoPreInitNilSessionPanic`).
+- A duplicate `initialized` outside `Initializing` is ignored or rejected, so `close(initComplete)` never executes twice (`InvNoDuplicateInitializedPanic`).
+- `shutdown` moves `Running -> Draining`, rejects new requests with `InvalidRequest`, cancels and awaits in-flight async handlers, and closes `s.session` only upon entering `ShutDown` (`InvNoPostShutdownNilSnapshotPanic`).
+
+Other components with the same flat structure need only an explicit enum and transition switch:
+
+- **`RefCountCache` entries:** `Pending -> Ready -> Deleted`, plus `Failed` (eliminating all 3 Tier 1 defects).
+- **Per-ID client watch registrations (`LspWatchRegistry`):** `Idle -> Registering -> Active -> Unregistering -> Removed`, plus `Uncertain` on RPC timeout (eliminating stranded timeout registrations and duplicate `client/unregisterCapability` RPCs).
+- **`api.Session` and `contentmapper` leases:** `Open -> Closing -> Closed` checked under one lock, blocking post-close inserts and mid-`Transform` handle teardown.
+- **Synchronous IPC transport (`ipc.SyncConn`, modeled in Target 4):** `Idle -> AwaitingResponse(seqID) -> HandlingNotification`, checking `ctx.Err()` before writing a request and correlating replies by unique sequence ID.
+
+### 4.2 Where Hierarchical Statecharts and Actors Earn Their Keep
+
+Flat FSMs become awkward when a lifecycle state supervises child tasks, timers, and parallel sub-protocols. XState's core primitives (hierarchical states, orthogonal regions, invoked child actors, entry/exit cleanup, and one serialized mailbox per actor) map directly onto the hardest Tier 1 and Tier 2 subsystems:
+
+1. **`lsp.Server` as a supervising root actor:**
+   - Owns the top-level lifecycle (`Uninitialized -> Initializing -> Running -> Draining -> ShutDown`).
+   - Inside `Running`, spawns invoked child actors for in-flight requests, progress reporting (`LspProgressLocale`), and client watch registration (`LspWatchRegistry`).
+   - Exiting `Running -> Draining` cancels every invoked child actor and waits for `ChildExited` events before entering `ShutDown` and closing `project.Session`.
+   - Receiving both requests and `$/cancelRequest` in one mailbox preserves wire causality, letting `$/cancelRequest` forward `Cancel` to a child request actor whether it is queued or running (`LspServerCancel`).
+   - Giving `projectLoadingProgress` its own child actor (`Idle / Delayed / Active`, timer, and stable message-key map reacting to `LocaleChanged` events in its mailbox) eliminates both `LspProgressLocale` defects (the `localeMu` data race and the stuck spinner on locale change).
+
+2. **`project.Session` as a coordinator actor supervising child reconcilers:**
+   - A parent `Session` actor (`Open -> Closing -> Closed`) owns pending file changes, pending ATA changes, inferred compiler options, user config changes, and the current `*Snapshot`. Routing `DidOpenFile`, `DidChangeCompilerOptionsForInferredProjects`, and `Close` through one mailbox makes it impossible to omit `snapshotUpdateMu` or clone a nil snapshot after `Close` (`SessionInferredOptions`).
+   - Child reconciler actors (watches, program diagnostics, global diagnostics, content-mapper registrations) each run a 2-state coalescing machine (`Idle` / `Syncing`, with a `dirty` flag) and own their private `applied` state. This removes `SessionGlobalDiag`, `SessionProgramDiag` stale overwrites, and all 3 `SessionWatchProtocol` defects.
+   - Invoked background extraction actors (such as `autoimport` bucket builds in Target 4) report a typed terminal outcome (`Extracted(bucket)` vs `Cancelled`), so a cancelled extraction never transitions a bucket to `Clean` or gets adopted into `s.snapshot`.
+
+3. **`fswatch` and `lspwatcher` as a hierarchical watcher actor:**
+   - A parent watcher (`Running -> Closing -> Closed`) owns the directory registry, OS subscriptions, and debounce state (`Idle -> Armed(timerGen) -> Firing`) inside one actor loop.
+   - Entry/exit of `Armed` creates and cancels the debounce timer; stale timer ticks or delayed `ErrWatchTerminated` callbacks carry a generation or subscription token and are dropped if they do not match current state. All 4 `fswatch` defects and both `lspwatcher` defects disappear.
+
+### 4.3 Where Statecharts and Actors Are the Wrong Tool
+
+Several verified bugs live on hot data-plane paths or stem from data ownership, where an actor mailbox would hurt throughput or miss the cause:
+
+- **`ExtendedConfigCache` (`ExtendedConfigDeadlock`):** Serializing config parsing through an actor would bottleneck parallel `tsc -b` loading. Speculative lock-free parsing plus `LoadOrStore` is faster and deadlock-free.
+- **`dirty.SyncMap` (5 defects):** Parallel snapshot building needs concurrent key access. A fixed-shard mutex map removes all 5 `proxyFor` bugs without funneling every map lookup through one mailbox.
+- **`OwnerCache.Release` (`OwnerCacheRelease`):** Needs identity-checked `sync.Map.CompareAndDelete(key, entry)`.
+- **`AutoImportRegistry` shared entrypoints (Target 4):** A data-ownership bug (tracking which buckets reference a shared symlink realpath), independent of control flow.
+- **`BuildOrchestratorWatch` (2 defects):** Primarily an object-reuse bug (mutating `*BuildTask` across cycles instead of allocating fresh per-cycle tasks with fresh channels and edges), though the outer watch loop (`Idle -> Scanning -> Building -> Reporting`) is a clean 4-state flat FSM.
+- **`project.checkerPool`:** Already verified safe across 26.9M+ TLC states with one `sync.Mutex` plus bounded semaphores; converting a high-frequency borrow pool into an actor adds channel overhead without adding safety.
+
+### 4.4 Idiomatic Go Translation of the XState Model
+
+Go does not need a reflection-based statechart runtime library. The idiomatic Go implementation keeps full compile-time typing and aligns 1-to-1 with TLA+ specifications:
+
+1. **Separate a pure reducer (`step`) from the actor runner:**
+   - Define sealed sum-type events (`type event interface { isEvent() }`), an explicit phase enum plus private actor state, and typed effect structs (`effSendRPC`, `effSpawnWorker`, `effCancelWorker`, `effResetTimer`, `effReply`).
+   - `step(s *state, ev event) []effect` holds zero locks, spawns zero goroutines, and performs zero I/O. Every `(phase, event)` pair is dispatched explicitly in a `switch s.phase`, so invalid combinations are rejected deterministically.
+   - A small runner goroutine owns the `select` loop over the actor's mailbox, executes returned effects, and feeds completion and timer events back into the mailbox.
+2. **Invoke blocking I/O as child goroutines outside the actor loop:**
+   - Slow RPCs (`client/registerCapability`, `PublishDiagnostics`, child-process `MethodTransform`) run in short-lived invoked goroutines that deliver `evRPCDone{id, gen, err}` back to the actor mailbox. The coordinator stays responsive to `$/cancelRequest` and `Shutdown` while all state transitions remain strictly sequential.
+3. **Keep the actor tree strictly hierarchical:**
+   - Go channels are bounded and block senders, so mutual synchronous sends between peer actors deadlock. Route commands parent-to-child and completion notifications child-to-parent (with `ctx.Done()` in every `select`).
+4. **Testing and TLA+ alignment:**
+   - `step` unit tests run synchronously in microseconds with zero flakiness.
+   - The goroutine runner tests deterministically under Go's `testing/synctest`.
+   - Because `step` is already a discrete transition function, TLA+ models mirror the Go state table directly.
+
+---
+
+## 5. Reference Pattern Already Proven Inside `tsc/internal`: `project.checkerPool`
 
 `CheckerPool.tla` explored 26.9M+ distinct states (depth 17) and 14.5M+ distinct states (depth 28) with zero violations. `tsc/internal/project/checkerpool.go` already demonstrates how the Go pattern works cleanly in this codebase:
 
@@ -149,16 +224,17 @@ The lost-notification defect (`SessionGlobalDiag`) only appeared one layer above
 
 ---
 
-## 5. Engineering Guardrails for Go Concurrency in `tsc/internal`
+## 6. Engineering Guardrails for Go Concurrency in `tsc/internal`
 
-Two properties of Go explain why these 22 bugs survived normal unit tests and CI `-race` runs:
+Two properties of Go explain why these 36 verified bugs survived normal unit tests and CI `-race` runs:
 
-1. **Go's `-race` detector checks memory synchronization only.** Twenty of the 22 verified defects are data-race-free logical races (deadlocks, lost wakeups, TOCTOU across two mutexes, orphaned child processes, double-closed channels, stale overwrites). `-race` caught only 2 (`dirty.SyncMap.Locked` and `BuildOrchestratorWatch` on `task.result`).
+1. **Go's `-race` detector checks memory synchronization only.** Thirty-two of the 36 verified defects are data-race-free logical races (deadlocks, nil-pointer panics, close-of-closed-channel panics, lost wakeups, TOCTOU across two mutexes, orphaned child processes, stale overwrites, leaked watches, and stuck progress spinners). `-race` caught only 4 (`dirty.SyncMap.Locked`, `BuildOrchestratorWatch` on `task.result`, `SessionInferredOptions`, and `LspProgressLocale` on `r.server.locale`).
 2. **Go does not tie locks to fields in the type system.** Porting imperative multi-step object mutations from single-threaded TypeScript 5 by adding per-field mutexes and `go func()` calls expands the cross-operation state space faster than hand-written tests can cover.
 
 Practical rules for reviewing and refactoring concurrent code in `tsc/internal`:
 
-- **One owner per state machine:** Prefer one goroutine loop (for I/O, timers, and ordered RPC side effects) or one mutex (for in-memory pools like `checkerPool`). Treat structs accumulating three or more mutexes, or pairing an `atomic.Bool` latch with a `sync.Mutex`, as candidates for consolidation.
+- **One owner per state machine:** Prefer one goroutine actor (for I/O, timers, and ordered RPC side effects) or one mutex (for in-memory pools like `checkerPool`). Treat structs accumulating three or more mutexes, or pairing an `atomic.Bool` latch with a `sync.Mutex`, as candidates for consolidation.
+- **Make lifecycles explicit:** Use a flat state enum for single-resource lifecycles and a hierarchical actor + pure `step` reducer when a lifecycle owns timers, cancellation, or child tasks.
 - **No unbounded `go func()` for ordered side effects:** Route external updates (watchers, diagnostics, registrations) through level-triggered reconcilers with 1-buffered channels.
 - **Inspect every lock release:** Any code that unlocks across I/O, RPC, or recursion needs either a retained scoped handle, an identity/generation check on re-entry, or speculative lock-free computation.
 - **Use `CompareAndDelete` and explicit state enums in concurrent caches:** Avoid encoding four lifecycle phases in boolean/counter combinations or deleting map keys without checking entry identity.
